@@ -3532,3 +3532,288 @@ func TestPodTopoSignatures(t *testing.T) {
 		})
 	}
 }
+
+func TestTaintedDomainExclusion(t *testing.T) {
+	tests := []struct {
+		name                         string
+		pod                          *v1.Pod
+		nodes                        []*v1.Node
+		existingPods                 []*v1.Pod
+		want                         *preFilterState
+		wantStatusCode               map[string]fwk.Code
+		enableNodeInclusionPolicy    bool
+		enableTaintedDomainExclusion bool
+	}{
+		{
+			// 3 zones [1,1,1], zone3 fully tainted. With the feature enabled,
+			// zone3 counts toward minDomains (3 >= 3) but is excluded from skew.
+			// Skew across zone1/zone2 is balanced, so scheduling succeeds.
+			name: "fully-tainted domain with existing pods unblocks scheduling",
+			pod: st.MakePod().Name("p").Label("foo", "").
+				SpreadConstraint(1, "zone", v1.DoNotSchedule, fooSelector, ptr.To[int32](3), nil, &honorPolicy, nil).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("zone", "zone1").Label("node", "node-a").Obj(),
+				st.MakeNode().Name("node-b").Label("zone", "zone2").Label("node", "node-b").Obj(),
+				st.MakeNode().Name("node-c").Label("zone", "zone3").Label("node", "node-c").Taints(taints).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("p-a1").Node("node-a").Label("foo", "").Obj(),
+				st.MakePod().Name("p-b1").Node("node-b").Label("foo", "").Obj(),
+				st.MakePod().Name("p-c1").Node("node-c").Label("foo", "").Obj(),
+			},
+			want: &preFilterState{
+				Constraints: []topologySpreadConstraint{
+					{
+						MaxSkew:            1,
+						TopologyKey:        "zone",
+						Selector:           mustConvertLabelSelectorAsSelector(t, fooSelector),
+						MinDomains:         3,
+						NodeAffinityPolicy: v1.NodeInclusionPolicyHonor,
+						NodeTaintsPolicy:   v1.NodeInclusionPolicyHonor,
+					},
+				},
+				CriticalPaths: []*criticalPaths{{{"zone1", 1}, {"zone2", 1}}},
+				TpValueToMatchNum: []map[string]int{{
+					"zone1": 1,
+					"zone2": 1,
+				}},
+				TaintedDomainCount: []int{1},
+			},
+			wantStatusCode: map[string]fwk.Code{
+				"node-a": fwk.Success,
+				"node-b": fwk.Success,
+				"node-c": fwk.Success, // Filter doesn't enforce taints; TaintToleration plugin does that
+			},
+			enableNodeInclusionPolicy:    true,
+			enableTaintedDomainExclusion: true,
+		},
+		{
+			// 3 zones [1,1,0], zone3 fully tainted but has zero matching pods.
+			// Domain should NOT count toward minDomains. domainsNum = 2 < minDomains = 3,
+			// so minMatchNum = 0. Skew = 1+1-0 = 2 > maxSkew(1), so scheduling fails
+			// on healthy nodes. node-c returns Success because this plugin doesn't
+			// enforce taints (TaintToleration handles that separately).
+			name: "fully-tainted domain with zero matching pods does not count",
+			pod: st.MakePod().Name("p").Label("foo", "").
+				SpreadConstraint(1, "zone", v1.DoNotSchedule, fooSelector, ptr.To[int32](3), nil, &honorPolicy, nil).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("zone", "zone1").Label("node", "node-a").Obj(),
+				st.MakeNode().Name("node-b").Label("zone", "zone2").Label("node", "node-b").Obj(),
+				st.MakeNode().Name("node-c").Label("zone", "zone3").Label("node", "node-c").Taints(taints).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("p-a1").Node("node-a").Label("foo", "").Obj(),
+				st.MakePod().Name("p-b1").Node("node-b").Label("foo", "").Obj(),
+				// node-c has no matching pods (p-c1 doesn't have label foo)
+				st.MakePod().Name("p-c1").Node("node-c").Label("bar", "").Obj(),
+			},
+			want: &preFilterState{
+				Constraints: []topologySpreadConstraint{
+					{
+						MaxSkew:            1,
+						TopologyKey:        "zone",
+						Selector:           mustConvertLabelSelectorAsSelector(t, fooSelector),
+						MinDomains:         3,
+						NodeAffinityPolicy: v1.NodeInclusionPolicyHonor,
+						NodeTaintsPolicy:   v1.NodeInclusionPolicyHonor,
+					},
+				},
+				CriticalPaths: []*criticalPaths{{{"zone1", 1}, {"zone2", 1}}},
+				TpValueToMatchNum: []map[string]int{{
+					"zone1": 1,
+					"zone2": 1,
+				}},
+				TaintedDomainCount: []int{0},
+			},
+			wantStatusCode: map[string]fwk.Code{
+				"node-a": fwk.Unschedulable,
+				"node-b": fwk.Unschedulable,
+				"node-c": fwk.Success, // TaintToleration plugin enforces taints, not this plugin
+			},
+			enableNodeInclusionPolicy:    true,
+			enableTaintedDomainExclusion: true,
+		},
+		{
+			// Same scenario as test 1, but with feature gate disabled.
+			// Without the feature, domainsNum = 2 < minDomains = 3, minMatchNum = 0.
+			// Skew = 1+1-0 = 2 > maxSkew(1), so scheduling fails on healthy nodes.
+			name: "feature gate disabled preserves original behavior",
+			pod: st.MakePod().Name("p").Label("foo", "").
+				SpreadConstraint(1, "zone", v1.DoNotSchedule, fooSelector, ptr.To[int32](3), nil, &honorPolicy, nil).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("zone", "zone1").Label("node", "node-a").Obj(),
+				st.MakeNode().Name("node-b").Label("zone", "zone2").Label("node", "node-b").Obj(),
+				st.MakeNode().Name("node-c").Label("zone", "zone3").Label("node", "node-c").Taints(taints).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("p-a1").Node("node-a").Label("foo", "").Obj(),
+				st.MakePod().Name("p-b1").Node("node-b").Label("foo", "").Obj(),
+				st.MakePod().Name("p-c1").Node("node-c").Label("foo", "").Obj(),
+			},
+			want: &preFilterState{
+				Constraints: []topologySpreadConstraint{
+					{
+						MaxSkew:            1,
+						TopologyKey:        "zone",
+						Selector:           mustConvertLabelSelectorAsSelector(t, fooSelector),
+						MinDomains:         3,
+						NodeAffinityPolicy: v1.NodeInclusionPolicyHonor,
+						NodeTaintsPolicy:   v1.NodeInclusionPolicyHonor,
+					},
+				},
+				CriticalPaths: []*criticalPaths{{{"zone1", 1}, {"zone2", 1}}},
+				TpValueToMatchNum: []map[string]int{{
+					"zone1": 1,
+					"zone2": 1,
+				}},
+			},
+			wantStatusCode: map[string]fwk.Code{
+				"node-a": fwk.Unschedulable,
+				"node-b": fwk.Unschedulable,
+				"node-c": fwk.Success, // TaintToleration plugin enforces taints, not this plugin
+			},
+			enableNodeInclusionPolicy:    true,
+			enableTaintedDomainExclusion: false,
+		},
+		{
+			// 3 zones: zone1 [1 pod, 1 healthy node], zone2 [1 pod, 1 healthy node],
+			// zone3 [2 pods, 1 healthy node + 1 tainted node].
+			// Because zone3 still has a healthy node (node-c), it is NOT fully tainted.
+			// zone3 appears in TpValueToMatchNum with count from the healthy node only (1 pod).
+			// The tainted node (node-d) contributes nothing — its pod is invisible.
+			// domainsNum = 3 (zone1, zone2, zone3 all in healthy map) >= minDomains = 3,
+			// so minMatchNum = min(1,1,1) = 1. Skew = 1+1-1 = 1 <= maxSkew(1), all pass.
+			// TaintedDomainCount = 0 because zone3 is in the healthy map.
+			name: "partially-tainted domain is not excluded",
+			pod: st.MakePod().Name("p").Label("foo", "").
+				SpreadConstraint(1, "zone", v1.DoNotSchedule, fooSelector, ptr.To[int32](3), nil, &honorPolicy, nil).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("zone", "zone1").Label("node", "node-a").Obj(),
+				st.MakeNode().Name("node-b").Label("zone", "zone2").Label("node", "node-b").Obj(),
+				st.MakeNode().Name("node-c").Label("zone", "zone3").Label("node", "node-c").Obj(),
+				st.MakeNode().Name("node-d").Label("zone", "zone3").Label("node", "node-d").Taints(taints).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("p-a1").Node("node-a").Label("foo", "").Obj(),
+				st.MakePod().Name("p-b1").Node("node-b").Label("foo", "").Obj(),
+				st.MakePod().Name("p-c1").Node("node-c").Label("foo", "").Obj(),
+				st.MakePod().Name("p-d1").Node("node-d").Label("foo", "").Obj(),
+			},
+			want: &preFilterState{
+				Constraints: []topologySpreadConstraint{
+					{
+						MaxSkew:            1,
+						TopologyKey:        "zone",
+						Selector:           mustConvertLabelSelectorAsSelector(t, fooSelector),
+						MinDomains:         3,
+						NodeAffinityPolicy: v1.NodeInclusionPolicyHonor,
+						NodeTaintsPolicy:   v1.NodeInclusionPolicyHonor,
+					},
+				},
+				CriticalPaths: []*criticalPaths{{{"zone1", 1}, {"zone2", 1}}},
+				TpValueToMatchNum: []map[string]int{{
+					"zone1": 1,
+					"zone2": 1,
+					"zone3": 1, // only the healthy node-c's pod is counted
+				}},
+				TaintedDomainCount: []int{0}, // zone3 is in healthy map, so not counted as tainted
+			},
+			wantStatusCode: map[string]fwk.Code{
+				"node-a": fwk.Success,
+				"node-b": fwk.Success,
+				"node-c": fwk.Success,
+				"node-d": fwk.Success, // TaintToleration plugin enforces taints, not this plugin
+			},
+			enableNodeInclusionPolicy:    true,
+			enableTaintedDomainExclusion: true,
+		},
+		{
+			// Node excluded by NodeAffinityPolicy (not by taints). Should not be
+			// tracked as a tainted domain even with the feature enabled.
+			// domainsNum = 2 (only zone1, zone2 healthy) + 0 tainted = 2 < minDomains = 3,
+			// so minMatchNum = 0. Skew = 1+1-0 = 2 > maxSkew(1), healthy nodes fail.
+			// node-c: zone3 not in TpValueToMatchNum so matchNum=0, skew = 0+1-0 = 1, passes.
+			name: "node excluded by affinity not tracked as tainted domain",
+			pod: st.MakePod().Name("p").Label("foo", "").
+				NodeSelector(map[string]string{"region": "us"}).
+				SpreadConstraint(1, "zone", v1.DoNotSchedule, fooSelector, ptr.To[int32](3), &honorPolicy, &honorPolicy, nil).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("zone", "zone1").Label("node", "node-a").Label("region", "us").Obj(),
+				st.MakeNode().Name("node-b").Label("zone", "zone2").Label("node", "node-b").Label("region", "us").Obj(),
+				// node-c is in zone3 but fails node affinity (no "region: us" label), not taints
+				st.MakeNode().Name("node-c").Label("zone", "zone3").Label("node", "node-c").Label("region", "eu").Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("p-a1").Node("node-a").Label("foo", "").Obj(),
+				st.MakePod().Name("p-b1").Node("node-b").Label("foo", "").Obj(),
+				st.MakePod().Name("p-c1").Node("node-c").Label("foo", "").Obj(),
+			},
+			want: &preFilterState{
+				Constraints: []topologySpreadConstraint{
+					{
+						MaxSkew:            1,
+						TopologyKey:        "zone",
+						Selector:           mustConvertLabelSelectorAsSelector(t, fooSelector),
+						MinDomains:         3,
+						NodeAffinityPolicy: v1.NodeInclusionPolicyHonor,
+						NodeTaintsPolicy:   v1.NodeInclusionPolicyHonor,
+					},
+				},
+				CriticalPaths: []*criticalPaths{{{"zone1", 1}, {"zone2", 1}}},
+				TpValueToMatchNum: []map[string]int{{
+					"zone1": 1,
+					"zone2": 1,
+				}},
+				// zone3 excluded by affinity, NOT by taints — should not be counted
+				TaintedDomainCount: []int{0},
+			},
+			wantStatusCode: map[string]fwk.Code{
+				"node-a": fwk.Unschedulable,
+				"node-b": fwk.Unschedulable,
+				"node-c": fwk.Success, // NodeAffinity plugin enforces affinity, not this plugin
+			},
+			enableNodeInclusionPolicy:    true,
+			enableTaintedDomainExclusion: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			snapshot := cache.NewSnapshot(tt.existingPods, tt.nodes)
+			pl := plugintesting.SetupPlugin(ctx, t, topologySpreadFunc, &config.PodTopologySpreadArgs{DefaultingType: config.ListDefaulting}, snapshot)
+			p := pl.(*PodTopologySpread)
+			p.enableNodeInclusionPolicyInPodTopologySpread = tt.enableNodeInclusionPolicy
+			p.enableTaintedDomainExclusionInPodTopologySpread = tt.enableTaintedDomainExclusion
+
+			nodeInfos, err := snapshot.NodeInfos().List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := framework.NewCycleState()
+			if _, s := p.PreFilter(ctx, state, tt.pod, nodeInfos); !s.IsSuccess() {
+				t.Errorf("preFilter failed with status: %v", s)
+			}
+
+			got, err := getPreFilterState(state)
+			if err != nil {
+				t.Fatalf("failed to get PreFilterState from cyclestate: %v", err)
+			}
+			if diff := cmp.Diff(tt.want, got, stateCmpOpts...); diff != "" {
+				t.Errorf("PreFilter() returned unexpected state (-want,+got):\n%s", diff)
+			}
+
+			for _, node := range tt.nodes {
+				nodeInfo, _ := snapshot.NodeInfos().Get(node.Name)
+				status := p.Filter(ctx, state, tt.pod, nodeInfo)
+				if len(tt.wantStatusCode) != 0 && status.Code() != tt.wantStatusCode[node.Name] {
+					t.Errorf("[%s]: expected status code %v got %v, reason: %v", node.Name, tt.wantStatusCode[node.Name], status.Code(), status.Message())
+				}
+			}
+		})
+	}
+}
