@@ -56,6 +56,25 @@ func (tsc *topologySpreadConstraint) matchNodeInclusionPolicies(logger klog.Logg
 	return true
 }
 
+// excludedOnlyByTaints returns true when the node would pass node affinity policy
+// but fails taint policy. Used to identify nodes excluded solely due to taints for
+// the TaintedDomainExclusionInPodTopologySpread feature.
+func (tsc *topologySpreadConstraint) excludedOnlyByTaints(logger klog.Logger, pod *v1.Pod, node *v1.Node, require nodeaffinity.RequiredNodeAffinity, enableComparisonOperators bool) bool {
+	if tsc.NodeAffinityPolicy == v1.NodeInclusionPolicyHonor {
+		// We ignore parsing errors here for backwards compatibility.
+		if match, _ := require.Match(node); !match {
+			return false
+		}
+	}
+
+	if tsc.NodeTaintsPolicy == v1.NodeInclusionPolicyHonor {
+		if _, untolerated := v1helper.FindMatchingUntoleratedTaint(logger, node.Spec.Taints, pod.Spec.Tolerations, helper.DoNotScheduleTaintsFilterFunc(), enableComparisonOperators); untolerated {
+			return true
+		}
+	}
+	return false
+}
+
 // buildDefaultConstraints builds the constraints for a pod using
 // .DefaultConstraints and the selectors from the services, replication
 // controllers, replica sets and stateful sets that match the pod.

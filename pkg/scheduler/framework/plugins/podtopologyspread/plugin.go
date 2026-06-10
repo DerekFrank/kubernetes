@@ -66,9 +66,10 @@ type PodTopologySpread struct {
 	replicationCtrls                             corelisters.ReplicationControllerLister
 	replicaSets                                  appslisters.ReplicaSetLister
 	statefulSets                                 appslisters.StatefulSetLister
-	enableNodeInclusionPolicyInPodTopologySpread bool
-	enableMatchLabelKeysInPodTopologySpread      bool
-	enableTaintTolerationComparisonOperators     bool
+	enableNodeInclusionPolicyInPodTopologySpread    bool
+	enableMatchLabelKeysInPodTopologySpread          bool
+	enableTaintTolerationComparisonOperators         bool
+	enableTaintedDomainExclusionInPodTopologySpread  bool
 }
 
 var _ fwk.PreFilterPlugin = &PodTopologySpread{}
@@ -117,9 +118,10 @@ func New(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.Fea
 		parallelizer:       h.Parallelizer(),
 		sharedLister:       h.SnapshotSharedLister(),
 		defaultConstraints: args.DefaultConstraints,
-		enableNodeInclusionPolicyInPodTopologySpread: fts.EnableNodeInclusionPolicyInPodTopologySpread,
-		enableMatchLabelKeysInPodTopologySpread:      fts.EnableMatchLabelKeysInPodTopologySpread,
-		enableTaintTolerationComparisonOperators:     fts.EnableTaintTolerationComparisonOperators,
+		enableNodeInclusionPolicyInPodTopologySpread:    fts.EnableNodeInclusionPolicyInPodTopologySpread,
+		enableMatchLabelKeysInPodTopologySpread:          fts.EnableMatchLabelKeysInPodTopologySpread,
+		enableTaintTolerationComparisonOperators:         fts.EnableTaintTolerationComparisonOperators,
+		enableTaintedDomainExclusionInPodTopologySpread:  fts.EnableTaintedDomainExclusionInPodTopologySpread,
 	}
 	if args.DefaultingType == config.SystemDefaulting {
 		pl.defaultConstraints = systemDefaultConstraints

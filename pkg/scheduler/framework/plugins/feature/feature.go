@@ -49,8 +49,9 @@ type Features struct {
 	EnableNodeDeclaredFeatures                    bool
 	EnableGangScheduling                          bool
 	EnableGenericWorkload                         bool
-	EnableTaintTolerationComparisonOperators      bool
-	EnableInPlacePodLevelResourcesVerticalScaling bool
+	EnableTaintTolerationComparisonOperators        bool
+	EnableTaintedDomainExclusionInPodTopologySpread bool
+	EnableInPlacePodLevelResourcesVerticalScaling   bool
 	EnableTopologyAwareWorkloadScheduling         bool
 	EnableWorkloadAwarePreemption                 bool
 }
@@ -81,8 +82,9 @@ func NewSchedulerFeaturesFromGates(featureGate featuregate.FeatureGate) Features
 		EnableNodeDeclaredFeatures:                    featureGate.Enabled(features.NodeDeclaredFeatures),
 		EnableGangScheduling:                          featureGate.Enabled(features.GangScheduling),
 		EnableGenericWorkload:                         featureGate.Enabled(features.GenericWorkload),
-		EnableTaintTolerationComparisonOperators:      featureGate.Enabled(features.TaintTolerationComparisonOperators),
-		EnableInPlacePodLevelResourcesVerticalScaling: featureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling),
+		EnableTaintTolerationComparisonOperators:        featureGate.Enabled(features.TaintTolerationComparisonOperators),
+		EnableTaintedDomainExclusionInPodTopologySpread: featureGate.Enabled(features.TaintedDomainExclusionInPodTopologySpread),
+		EnableInPlacePodLevelResourcesVerticalScaling:   featureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling),
 		EnableTopologyAwareWorkloadScheduling:         featureGate.Enabled(features.TopologyAwareWorkloadScheduling),
 		EnableDRANodeAllocatableResources:             featureGate.Enabled(features.DRANodeAllocatableResources),
 		EnableWorkloadAwarePreemption:                 featureGate.Enabled(features.WorkloadAwarePreemption),

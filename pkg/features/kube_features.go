@@ -1064,6 +1064,13 @@ const (
 	// Enables numeric comparison operators (Lt, Gt) for tolerations to match taints with threshold-based values.
 	TaintTolerationComparisonOperators featuregate.Feature = "TaintTolerationComparisonOperators"
 
+	// owner: @derekff
+	// kep: https://kep.k8s.io/NNNN
+	//
+	// When nodeTaintsPolicy is Honor, topology domains whose nodes are all tainted (and not
+	// tolerated by the incoming pod) count toward minDomains but are excluded from skew calculation.
+	TaintedDomainExclusionInPodTopologySpread featuregate.Feature = "TaintedDomainExclusionInPodTopologySpread"
+
 	// owner: @44past4
 	// kep: https://kep.k8s.io/5732
 	//
@@ -1950,6 +1957,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.35"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
+	TaintedDomainExclusionInPodTopologySpread: {
+		{Version: version.MustParse("1.37"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
 	TopologyAwareWorkloadScheduling: {
 		{Version: version.MustParse("1.36"), Default: false, PreRelease: featuregate.Alpha},
 	},
@@ -2539,6 +2550,8 @@ var defaultKubernetesFeatureGateDependencies = map[featuregate.Feature][]feature
 	SystemdWatchdog: {},
 
 	TaintTolerationComparisonOperators: {},
+
+	TaintedDomainExclusionInPodTopologySpread: {NodeInclusionPolicyInPodTopologySpread},
 
 	TopologyAwareWorkloadScheduling: {GenericWorkload},
 

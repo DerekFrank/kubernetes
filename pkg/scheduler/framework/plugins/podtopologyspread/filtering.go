@@ -49,6 +49,10 @@ type preFilterState struct {
 	// TpValueToMatchNum is a slice indexed by constraint index.
 	// Each entry is keyed with topology value, and valued with the number of matching pods.
 	TpValueToMatchNum []map[string]int
+	// TaintedDomainCount tracks, per constraint, the number of fully-tainted topology
+	// domains that have existing matching pods. These domains count toward minDomains
+	// but are excluded from skew.
+	TaintedDomainCount []int
 }
 
 // minMatchNum returns the global minimum for the calculation of skew while taking MinDomains into account.
@@ -57,6 +61,11 @@ func (s *preFilterState) minMatchNum(constraintID int, minDomains int32) (int, e
 
 	minMatchNum := paths[0].MatchNum
 	domainsNum := len(s.TpValueToMatchNum[constraintID])
+
+	// Include fully-tainted domains (with existing pods) in the domain count for minDomains.
+	if len(s.TaintedDomainCount) > constraintID {
+		domainsNum += s.TaintedDomainCount[constraintID]
+	}
 
 	if domainsNum < int(minDomains) {
 		// When the number of eligible domains with matching topology keys is less than `minDomains`,
@@ -83,6 +92,9 @@ func (s *preFilterState) Clone() fwk.StateData {
 	}
 	for i, tpMap := range s.TpValueToMatchNum {
 		copy.TpValueToMatchNum[i] = maps.Clone(tpMap)
+	}
+	if s.TaintedDomainCount != nil {
+		copy.TaintedDomainCount = append([]int(nil), s.TaintedDomainCount...)
 	}
 	return &copy
 }
@@ -253,7 +265,15 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod,
 		s.TpValueToMatchNum[i] = make(map[string]int, sizeHeuristic(len(allNodes), constraints[i]))
 	}
 
+	trackTaintedDomains := pl.enableTaintedDomainExclusionInPodTopologySpread &&
+		pl.enableNodeInclusionPolicyInPodTopologySpread
+
 	tpCountsByNode := make([][]topologyCount, len(allNodes))
+	var taintedCountsByNode [][]topologyCount
+	if trackTaintedDomains {
+		taintedCountsByNode = make([][]topologyCount, len(allNodes))
+	}
+
 	requiredNodeAffinity := nodeaffinity.GetRequiredNodeAffinity(pod)
 	processNode := func(n int) {
 		nodeInfo := allNodes[n]
@@ -273,10 +293,26 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod,
 		}
 
 		tpCounts := make([]topologyCount, 0, len(constraints))
+		var taintedCounts []topologyCount
+		if trackTaintedDomains {
+			taintedCounts = make([]topologyCount, 0, len(constraints))
+		}
+
 		for i, c := range constraints {
-			if pl.enableNodeInclusionPolicyInPodTopologySpread &&
-				!c.matchNodeInclusionPolicies(logger, pod, node, requiredNodeAffinity, pl.enableTaintTolerationComparisonOperators) {
-				continue
+			if pl.enableNodeInclusionPolicyInPodTopologySpread {
+				if !c.matchNodeInclusionPolicies(logger, pod, node, requiredNodeAffinity, pl.enableTaintTolerationComparisonOperators) {
+					if trackTaintedDomains && c.NodeTaintsPolicy == v1.NodeInclusionPolicyHonor &&
+						c.excludedOnlyByTaints(logger, pod, node, requiredNodeAffinity, pl.enableTaintTolerationComparisonOperators) {
+						value := node.Labels[c.TopologyKey]
+						count := countPodsMatchSelector(nodeInfo.GetPods(), c.Selector, pod.Namespace)
+						taintedCounts = append(taintedCounts, topologyCount{
+							topologyValue: value,
+							constraintID:  i,
+							count:         count,
+						})
+					}
+					continue
+				}
 			}
 
 			value := node.Labels[c.TopologyKey]
@@ -288,6 +324,9 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod,
 			})
 		}
 		tpCountsByNode[n] = tpCounts
+		if trackTaintedDomains {
+			taintedCountsByNode[n] = taintedCounts
+		}
 	}
 	pl.parallelizer.Until(ctx, len(allNodes), processNode, pl.Name())
 
@@ -295,6 +334,33 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod,
 		// tpCounts might not hold all the constraints, so index can't be used here as constraintID.
 		for _, tpCount := range tpCounts {
 			s.TpValueToMatchNum[tpCount.constraintID][tpCount.topologyValue] += tpCount.count
+		}
+	}
+
+	// Track tainted domains: aggregate pod counts per topology value for nodes excluded by taints.
+	if trackTaintedDomains {
+		// taintedDomainPods[constraintID][topologyValue] = pod count across tainted nodes
+		taintedDomainPods := make([]map[string]int, len(constraints))
+		for i := range taintedDomainPods {
+			taintedDomainPods[i] = make(map[string]int)
+		}
+		for _, taintedCounts := range taintedCountsByNode {
+			for _, tc := range taintedCounts {
+				taintedDomainPods[tc.constraintID][tc.topologyValue] += tc.count
+			}
+		}
+
+		s.TaintedDomainCount = make([]int, len(constraints))
+		for i, domains := range taintedDomainPods {
+			for tpVal, podCount := range domains {
+				// Only count domains that are fully tainted (not present in healthy map)
+				// and have at least one matching pod.
+				if _, existsInHealthy := s.TpValueToMatchNum[i][tpVal]; !existsInHealthy && podCount > 0 {
+					s.TaintedDomainCount[i]++
+					logger.V(5).Info("Tainted domain counted toward minDomains",
+						"constraintIndex", i, "topologyValue", tpVal, "matchingPods", podCount)
+				}
+			}
 		}
 	}
 
