@@ -20,11 +20,38 @@ import (
 )
 
 // Schedule evaluates a batch of pods against existing nodes and potential capacity,
-// returning bindings, NodeClaims, and preemptions in one pass.
+// returning bindings, NodeClaims, and preemptions in one pass. It is a thin entry
+// point: it builds the per-solve view over the (immutable) cluster snapshot and
+// delegates to solve(). See Deschedule for the consolidation entry point — both
+// share solve().
 func Schedule(
 	ctx context.Context,
 	f framework.Framework,
 	input Input,
+	opts Options,
+) (*Result, error) {
+	// Cluster view this solve runs against: a copy-on-write overlay over the
+	// immutable base snapshot. Tentative placements are recorded into the overlay
+	// (never the base) so later pods in the batch spread against earlier ones and
+	// the base stays shareable.
+	view := input.view
+	if view == nil {
+		view = newView(input.base())
+	}
+	return solve(ctx, f, view, input.Pods, input.Offerings, opts)
+}
+
+// solve is the shared engine behind Schedule and Deschedule: it places a batch of
+// pods against a cluster view (existing nodes + potential capacity), greedily and
+// largest-first, scoring bind / pack-onto-in-flight / provision on one marginal-cost
+// axis. It is a pure function — it records tentative placements into the view and
+// returns a plan, but performs no I/O and commits nothing. The caller executes.
+func solve(
+	ctx context.Context,
+	f framework.Framework,
+	snap *view,
+	inputPods []*v1.Pod,
+	offerings []*capacity.InstanceType,
 	opts Options,
 ) (*Result, error) {
 	result := &Result{
@@ -32,20 +59,11 @@ func Schedule(
 	}
 
 	// Sort pods largest-first for greedy packing
-	pods := make([]*v1.Pod, len(input.Pods))
-	copy(pods, input.Pods)
+	pods := make([]*v1.Pod, len(inputPods))
+	copy(pods, inputPods)
 	sort.Slice(pods, func(i, j int) bool {
 		return podResourceScore(pods[i]) > podResourceScore(pods[j])
 	})
-
-	// Cluster view this solve runs against: a copy-on-write overlay over the
-	// immutable base snapshot. Tentative placements are recorded into the overlay
-	// (never the base) so later pods in the batch spread against earlier ones and
-	// the base stays shareable.
-	snap := input.view
-	if snap == nil {
-		snap = newView(input.base())
-	}
 
 	// in-flight new nodes already committed to in this batch (Karpenter's
 	// "in-flight NodeClaims"). The unconstrained dummy is held separately and
@@ -103,7 +121,7 @@ func Schedule(
 		// the valid-domain set per spread key, injected into each candidate's
 		// requirements so off-skew domains are priced out of the superposition by
 		// the same narrowing as everything else. nil if the pod has no spread.
-		topoUniverse := topologyUniverse(pod, input.Offerings, snap)
+		topoUniverse := topologyUniverse(pod, offerings, snap)
 		topoReqs := topologyDomainReqs(pod, snap, topoUniverse)
 
 		// --- Tier 0: existing real nodes (marginal cost ~0 — already paid) ---
@@ -172,7 +190,7 @@ func Schedule(
 		// whether existing/in-flight candidates are feasible. The dummy is built
 		// fresh per pod from the full offering set, then narrowed by Filter; its
 		// baseline is 0 because it is not yet part of the plan.
-		dummy := createPotentialNode(pod, input.Offerings)
+		dummy := createPotentialNode(pod, offerings)
 		if dummy != nil {
 			status := f.RunFilterPlugins(ctx, state, pod, dummy)
 			if status.IsSuccess() {
@@ -367,11 +385,7 @@ func Deschedule(
 	opts Options,
 ) (*Result, error) {
 	reduced, displaced := newView(input.base()).withoutNodes(nodeNames...)
-	return Schedule(ctx, f, Input{
-		Pods:      displaced,
-		Offerings: input.Offerings,
-		view:      reduced,
-	}, opts)
+	return solve(ctx, f, reduced, displaced, input.Offerings, opts)
 }
 
 // resourceFitsConcrete reports whether pod's CPU/memory requests fit on a node

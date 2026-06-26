@@ -1,11 +1,53 @@
 # POC Design Decisions
 
 **Last updated:** 2026-06-26
-**Scope:** the unified scheduling POC in this `pkg/scheduler/unified/` package. A fuller as-built status doc (`poc-status.md`) and the original plan (`poc-plan.md`) are maintained outside this repo; this doc is self-contained on the decisions.
+**Scope:** the unified scheduling POC in this `pkg/scheduler/unified/` package — a single function that evaluates binding to existing nodes, provisioning new ones, and consolidation on one cost axis.
 
-This doc records the **major design questions** the unified-scheduling POC has taken a stance on (D1–D16), with the rationale and status of each, plus the **open questions** (O1–O6) we have *not* yet decided. It is the reader's-digest entry point for the design.
+This doc records the **major design questions** the POC has taken a stance on (D1–D16), with the rationale and status of each, plus the **open questions** (O1–O6) still undecided. It is the reader's-digest entry point for the design.
 
-Each decision entry: **Stance** what we decided, **Why** the reasoning, **Status** built / designed / decided-not-built / changed-our-mind. The "Open Design Questions" section at the end holds the live forks — things still genuinely undecided, not stances.
+Each decision entry: **Stance** what was decided, **Why** the reasoning, **Status** built / designed / decided-not-built / changed-my-mind. The "Open Design Questions" section at the end holds the live forks — things still genuinely undecided, not stances.
+
+---
+
+## Architecture
+
+The two public entry points, `Schedule(pods)` and `Deschedule(nodes)`, are thin; both build a per-solve `view` over the immutable cluster `Snapshot` and call the shared **`solve()`** core. `solve()` reuses the real kube-scheduler **framework plugins** (modified to understand PotentialNodes) for feasibility, and the local **scorers** for the cost decision. It returns a plan; the **caller** executes it.
+
+```mermaid
+flowchart TB
+    subgraph callers["Callers (own batch composition · execution · backoff · commit)"]
+        binder["binder + provisioner"]
+        consol["consolidation"]
+        kueue["Kueue (admission)"]
+    end
+
+    sched["Schedule(pods)<br/><i>pending pods</i>"]
+    desched["Deschedule(nodes)<br/><i>mask nodes → displaced pods</i>"]
+
+    callers -->|"pods"| sched
+    callers -->|"nodes"| desched
+
+    sched -->|"solve(view(snap), pods, offerings)"| solve
+    desched -->|"solve(view(snap − nodes), displacedPods, offerings)"| solve
+
+    subgraph engine["solve(view, pods, offerings, opts) — pure, no I/O"]
+        direction TB
+        loop["per pod, largest-first:<br/>PreFilter → Filter → expand → score → argmin(effectiveCost)<br/>candidates = existing nodes ∪ in-flight claims ∪ {dummy}<br/>commit winner into the view; topology injected up front, recorded on pin"]
+    end
+    solve["solve()"] --> engine
+
+    plugins["kube-scheduler framework plugins<br/>(modified — PotentialNode-aware)<br/>NodeResourcesFitUnified · NodeAffinityUnified · TaintTolerationUnified"]
+    scorers["scorers<br/>price · flexibility · preference"]
+    snap["Snapshot (immutable base)<br/>+ per-solve view (COW overlay)"]
+
+    plugins -->|"Filter: narrows superposition as a side effect"| engine
+    scorers -->|"effectiveCost"| engine
+    snap <-->|"reads / tentative writes"| engine
+
+    engine -->|"Result{Bindings, NodeClaims, Preemptions}"| callers
+```
+
+Key shapes the diagram encodes (each a decision below): `solve()` is the single engine both entry points share (D2, D11); it's a **pure function** that returns a plan and never executes (D13); the caller owns batch composition / execution / failure handling (D14); feasibility comes from **real framework plugins** mutated to narrow superpositions, while the cost decision is the **scorer `argmin`** (D2, D7); cluster state is an **immutable Snapshot + per-solve view** (D10); and `Deschedule` is just `solve` over a node-removed view (D11).
 
 ---
 
@@ -28,7 +70,7 @@ Everything below reduces to two commitments:
 ### D2. How do bind / provision / pack-onto-in-flight compete?
 - **Stance:** One marginal-cost axis, `argmin`, ties broken by tier (`existing < in-flight < dummy`).
 - **Why:** Karpenter hard-codes the `existing → in-flight → new` ordering; here it *falls out* of marginal cost (existing ≈ 0 ≤ in-flight delta ≤ a whole new node) rather than being a gate. Real nodes win ties (no launch latency, no stockout risk).
-- **Status:** Built (three-tier candidate model in `Schedule()`).
+- **Status:** Built (three-tier candidate model in `solve()`).
 
 ### D3. Is preemption a special phase?
 - **Stance:** No — preemption is **deferred provisioning**: a candidate scored at `marginalCost(re-place victim) + disruption`.
@@ -41,13 +83,13 @@ Everything below reduces to two commitments:
 
 ## Scoring & preferences
 
-### D5. How do soft preferences enter scoring? *(changed our minds, now rebuilt)*
-- **Stance:** **Multiplicative cost-adjustment** ("newer gen is 20% better" → `cost × 0.8`); **tipping = make it a hard constraint.** *Not* the additive `PreferenceValue` benefit term we first built.
+### D5. How do soft preferences enter scoring? *(changed my mind, now rebuilt)*
+- **Stance:** **Multiplicative cost-adjustment** ("newer gen is 20% better" → `cost × 0.8`); **tipping = make it a hard constraint.** *Not* the additive `PreferenceValue` benefit term I first built.
 - **Why:** The additive model needs an absolute `$/hr` valuation no user can set, and it lets a soft preference burn a whole new node. Multiplicative-on-cost is unit-free (everything is dollars), composes order-free, and — because `$0 × k = $0` — *cannot* tip provision-over-free-bind, which is the correct behavior. Preference value is a **workload** property, not a capacity one. If a preference is worth launching a node, it isn't soft → use `requiredDuringScheduling`.
-- **Status:** Built. The additive `PreferenceValue` term and `preferenceScorer`/`concreteNodeBenefit` are deleted; `priceScorer` now applies `price × (1 − weight×PreferenceDiscount)` for every preference the option's set *guarantees* (capped <1 so it never reaches $0). Tier-0 existing nodes score `effCost 0`, so a soft preference structurally cannot tip provisioning. Tests rewritten to assert the new model (`SoftPreferenceDoesNotTipProvisioning`, `PreferenceRanksOfferingsWhenProvisioning`, etc.). Still future work: source the discount from a workload-authored CEL expression (today it's a single `Options.PreferenceDiscount` × the affinity weight). Cost-adjustments must reference **pinnable labels** (arch/gen/family), since a continuous CEL isn't invertible to a label constraint for narrowing.
+- **Status:** Built. The additive `PreferenceValue` term and `preferenceScorer`/`concreteNodeBenefit` are deleted; `priceScorer` now applies `price × (1 − weight×PreferenceDiscount)` for every preference the option's set *guarantees* (capped <1 so it never reaches $0). Tier-0 existing nodes score `effCost 0`, so a soft preference structurally cannot tip provisioning. Tests assert the new model (`SoftPreferenceDoesNotTipProvisioning`, `PreferenceRanksOfferingsWhenProvisioning`, etc.). Still future work: source the discount from a workload-authored CEL expression (today it's a single `Options.PreferenceDiscount` × the affinity weight). Cost-adjustments must reference **pinnable labels** (arch/gen/family), since a continuous CEL isn't invertible to a label constraint for narrowing.
 
 ### D6. Where does "honor the preference" live?
-- **Stance:** The constraint is an **output** of scoring, not an input. The winning option carries its own narrowing; we pin it at commit. Preferences never filter the candidate set.
+- **Stance:** The constraint is an **output** of scoring, not an input. The winning option carries its own narrowing, which is pinned at commit. Preferences never filter the candidate set.
 - **Why:** Because nothing is filtered, the candidate set never empties — which **eliminates Karpenter's promote-to-hard + relax retry loop** for soft terms. "Score arm, launch arm" with all sibling arm types retained (multi-type pin).
 - **Status:** Built (commit-time pinning of the winning option).
 
@@ -58,8 +100,8 @@ Everything below reduces to two commitments:
 
 ### D8. Reuse kube-scheduler's `[0,100]` normalization?
 - **Stance:** No.
-- **Why:** Bounded per-cycle rescaling destroys the absolute magnitude and the stable zero our marginal-cost model depends on; kube-scheduler's weights compose *same-unit* signals, whereas our problem is *cross-unit* conversion. (The D5 multiplicative reframe then dissolves most of our remaining normalization problem by keeping everything in dollars.)
-- **Status:** Decided. Open: how foreign `[0,100]` plugins map onto the `$/hr` axis, and where strict (lexicographic) ordering lives — both in Remaining Considerations.
+- **Why:** Bounded per-cycle rescaling destroys the absolute magnitude and the stable zero the marginal-cost model depends on; kube-scheduler's weights compose *same-unit* signals, whereas the problem here is *cross-unit* conversion. (The D5 multiplicative reframe then dissolves most of the remaining normalization problem by keeping everything in dollars.)
+- **Status:** Decided. Open: how foreign `[0,100]` plugins map onto the `$/hr` axis, and where strict (lexicographic) ordering lives (see O2, O3).
 
 ---
 
@@ -67,9 +109,9 @@ Everything below reduces to two commitments:
 
 ### D9. Inline vs. post-hoc fix for greedy mispacking?
 - **Stance:** **Inline lookahead**, not a post-hoc split pass (Karpenter PR #3008). Credit each candidate by the fillable headroom that remaining batch demand can use, priced per-unit.
-- **Why:** Per-pod marginal cost is myopic — it bills one pod the whole instance-tier jump, so tight fresh nodes beat growing in-flight ones, opening many small nodes. The credit removes that billing artifact so packing happens at decision time, with no split machinery, no displaced-pod estimator, no "can't price these pods" gap. We tested this against an *unmerged* Karpenter proposal and it works: 375 → 28 nodes.
+- **Why:** Per-pod marginal cost is myopic — it bills one pod the whole instance-tier jump, so tight fresh nodes beat growing in-flight ones, opening many small nodes. The credit removes that billing artifact so packing happens at decision time, with no split machinery, no displaced-pod estimator, no "can't price these pods" gap. Tested against an *unmerged* Karpenter proposal and it works: 375 → 28 nodes on the 1000-pod benchmark.
 - **Status:** Built (`PackingWeight`, default off). `PackingWeight=1.0` is principled (headroom at par), not tuned — verified by sweep (2.0 packs worse).
-- *(Note: the "is the scheduler intrinsically quadratic at scale" question is a measured finding, not a design decision — the "50s" was a loose-packing symptom, not an algorithmic limit, fixed by the lookahead. A finding, not a fork, so it's not listed here.)*
+- *(Note: the "is the scheduler intrinsically quadratic at scale" question is a measured finding, not a design decision — the "50s for 1000 pods" was a loose-packing symptom, not an algorithmic limit, fixed by the lookahead. A finding, not a fork, so it's not listed here.)*
 
 ---
 
@@ -78,10 +120,10 @@ Everything below reduces to two commitments:
 ### D10. How is cluster state represented and shared?
 - **Stance:** **Immutable `Snapshot` base + per-solve copy-on-write `view`.** The base is never mutated and is shared by pointer across concurrent solves; per-solve deltas (tentative placements, masks, resource totals) live in the view.
 - **Why:** Lets a live provision loop and an always-running consolidation sim share one base with no locking — the precondition for the RCU model. The race detector caught the original code mutating the shared base (`AddPodInfo`); resource accounting was moved into the view to fix it.
-- **Status:** Built and `-race`-proven (16 concurrent solves). The RCU publish/swap + incremental writer-side updates on top are **not** built.
+- **Status:** Built and `-race`-proven (16 concurrent solves). The RCU publish/swap + incremental writer-side updates on top are **not** built (see O6).
 
 ### D11. How does node removal (consolidation) work?
-- **Stance:** Propagate the removal through derived indexes **exactly as a real deletion would** — not a lazy "skip on read" mask. `Deschedule(nodes)` is a thin wrapper: mask the nodes (their pods become the displaced set) → `Schedule` the displaced pods.
+- **Stance:** Propagate the removal through derived indexes **exactly as a real deletion would** — not a lazy "skip on read" mask. `Deschedule(nodes)` is a thin wrapper: mask the nodes (their pods become the displaced set) → `solve()` the displaced pods against the reduced view.
 - **Why:** A node's pods feed cluster-wide aggregates (topology counts, etc.). Hiding the node on read while leaving its pods in the counts makes the scheduler spread against phantoms. Removal must decrement every aggregate the pods fed.
 - **Status:** Built (`withoutNodes`, `Deschedule`; index-consistency-after-removal tested).
 
@@ -118,19 +160,19 @@ Everything below reduces to two commitments:
 
 ## Open Design Questions
 
-These are genuine forks we have **not** taken a stance on yet (distinct from the decisions above, which are settled).
+These are genuine forks with no stance taken yet (distinct from the decisions above, which are settled).
 
 ### O1. Is expand-then-score the right scoring mechanism? *(leaning: replace)*
-The expand-then-score lattice is built and correct, but its cost scales with **catalog width** — 500 instance types is ~100–1000× the no-offerings cost, because every pod expands an option lattice over the full surviving type set, and real catalogs are wide. The binding hot path is at parity with kube-scheduler (architecture sound); the *scoring inner loop* is the gating perf concern. Directions: per-pod catalog pruning, representative-offering scoring, or a non-lattice formulation. The D5 multiplicative-cost-adjustment may itself be the replacement (no honor/don't-honor lattice to expand). This is the clearest "we have evidence to reconsider" item.
+The expand-then-score lattice is built and correct, but its cost scales with **catalog width** — 500 instance types is ~100–1000× the no-offerings cost, because every pod expands an option lattice over the full surviving type set, and real catalogs are wide. The binding hot path is at parity with kube-scheduler (architecture sound); the *scoring inner loop* is the gating perf concern. Directions: per-pod catalog pruning, representative-offering scoring, or a non-lattice formulation. The D5 multiplicative-cost-adjustment may itself be the replacement (no honor/don't-honor lattice to expand). This is the clearest "there's evidence to reconsider" item.
 
 ### O2. How do foreign / non-priced scoring signals join the cost axis?
-The cost axis is `$/hr`. Open: (a) how a third-party Score plugin authored against kube-scheduler's `[0,100]` scale maps onto it; (b) whether the axis should be raw `$/hr` or an abstract comparable so non-priced environments (node groups, on-prem, fixed fleets with no per-offering price) are first-class; (c) a documented total order with explicit tie-breaks so the `argmin` is reproducible. (D8 settled that we *don't* adopt `[0,100]` normalization; this is the unresolved remainder.)
+The cost axis is `$/hr`. Open: (a) how a third-party Score plugin authored against kube-scheduler's `[0,100]` scale maps onto it; (b) whether the axis should be raw `$/hr` or an abstract comparable so non-priced environments (node groups, on-prem, fixed fleets with no per-offering price) are first-class; (c) a documented total order with explicit tie-breaks so the `argmin` is reproducible. (D8 settled that `[0,100]` normalization is *not* adopted; this is the unresolved remainder.)
 
 ### O3. Where does strict (lexicographic) ordering live?
 The scorers are a commutative bag, which structurally cannot encode a hard ordering like "reserved → spot → on-demand, never violated." Strict-ordering policies are real autoscaler requirements and need a home that isn't the scorer bag (a pre-scoring partition, or a lexicographic comparator above the cost `argmin`). Unresolved.
 
 ### O4. Soft-preference "honor at a marginal cost" on in-flight nodes
-D5 settled the common case (multiplicative discount; soft preferences rank offerings, never tip provisioning). The unbuilt refinement: a soft preference *should* be able to tighten an **in-flight node being provisioned anyway** when the marginal packing cost is low. Pricing that cost (expected extra-node cost when remaining batch demand no longer fits) unifies flexibility + packing-lookahead, but needs a dedicated signal we deferred as too much machinery for the POC.
+D5 settled the common case (multiplicative discount; soft preferences rank offerings, never tip provisioning). The unbuilt refinement: a soft preference *should* be able to tighten an **in-flight node being provisioned anyway** when the marginal packing cost is low. Pricing that cost (expected extra-node cost when remaining batch demand no longer fits) unifies flexibility + packing-lookahead, but needs a dedicated signal deferred as too much machinery for the POC.
 
 ### O5. Recursive displacement cost (preemption / consolidation depth)
 The cost-of-displacement principle (meta-stance #1) is recursive in theory, but the POC computes no recursion — preemption isn't built, and `Deschedule` re-places displaced pods one level deep. Production needs a *bounded* recursion (one level, or a cheap re-placement estimate) and a decision on how deep.
