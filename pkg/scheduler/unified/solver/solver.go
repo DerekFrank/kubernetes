@@ -29,15 +29,25 @@ type Problem struct {
 	// Offerings is the catalog new capacity can be built from.
 	Offerings []*capacity.InstanceType
 	// Narrowers are the constraint plugins every solver consults. Empty means the
-	// built-in defaults (taints + requirements) via virtualnode.DefaultNarrowers.
+	// built-in node-local defaults (taints + affinity + resources) via
+	// virtualnode.DefaultNarrowers.
 	Narrowers []virtualnode.Narrower
+	// Topology, if set, carries the cross-pod spread state (per-key domain counts +
+	// universe). It is the PreFilter-analog state a topology-spread Narrower needs
+	// and a single (pod, claim) pair cannot hold. When set, a TopologySpreadNarrower
+	// reading/updating it is appended to the narrower chain.
+	Topology *virtualnode.Topology
 }
 
 func (p Problem) narrowers() []virtualnode.Narrower {
-	if len(p.Narrowers) == 0 {
-		return virtualnode.DefaultNarrowers()
+	ns := p.Narrowers
+	if len(ns) == 0 {
+		ns = virtualnode.DefaultNarrowers()
 	}
-	return p.Narrowers
+	if p.Topology != nil {
+		ns = append(append([]virtualnode.Narrower(nil), ns...), virtualnode.NewTopologySpreadNarrower(p.Topology))
+	}
+	return ns
 }
 
 // NodeClaim is the Kubernetes-shaped output for one piece of new capacity: the
@@ -185,6 +195,14 @@ func tryAdd(claim *virtualnode.PotentialNode, pod *v1.Pod, narrowers []virtualno
 		return false
 	}
 	claim.AddPod(pod)
+	// Fire commit hooks for Narrowers that maintain cross-pod state (topology): the
+	// placement is now kept, so their shared state must reflect it for the next pod.
+	// Only reached on a successful, non-rolled-back placement.
+	for _, n := range narrowers {
+		if c, ok := n.(virtualnode.Committer); ok {
+			c.OnCommit(pod, claim)
+		}
+	}
 	return true
 }
 

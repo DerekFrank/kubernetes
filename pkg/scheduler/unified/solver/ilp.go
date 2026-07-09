@@ -35,6 +35,13 @@ func (s ILP) Solve(p Problem) []Solution {
 		// Too large for exact search — defer to greedy so we never block or return junk.
 		return Greedy{}.Solve(p)
 	}
+	if p.Topology != nil {
+		// Topology spread maintains shared cross-pod state updated on commit. The
+		// branch-and-bound search probes placements it later abandons, which would
+		// corrupt that state — so defer to greedy (single-pass, commit == kept) when
+		// spread is in play. (A topology-aware ILP would need per-branch state clones.)
+		return Greedy{}.Solve(p)
+	}
 	narrowers := p.narrowers()
 
 	// Search largest-first: better bounds earlier (big pods constrain most).
