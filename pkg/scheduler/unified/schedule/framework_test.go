@@ -8,46 +8,89 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	fwk "k8s.io/kube-scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
-	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
 )
 
-// TestRealFramework_FilterPotentialNode demonstrates the modified plugins running
-// inside the real kube-scheduler framework against a PotentialNode.
 func init() {
 	metrics.Register()
 }
 
-func TestRealFramework_FilterPotentialNode(t *testing.T) {
-	ctx := context.Background()
+// noopBind satisfies the required Bind extension point for benchmarks that build a
+// real framework (comparison_bench_test.go).
+type noopBind struct{}
 
-	f, err := frameworkruntime.NewFramework(ctx, makeTestRegistry(),
-		makeTestProfile(plugins.NodeResourcesFitUnifiedName, plugins.NodeAffinityUnifiedName, plugins.TaintTolerationUnifiedName))
-	if err != nil {
-		t.Fatalf("NewFramework failed: %v", err)
+func (noopBind) Name() string { return "NoopBind" }
+func (noopBind) Bind(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ string) *fwk.Status {
+	return nil
+}
+
+// TestBindPath_UsesStockPlugins verifies the binding path runs UNMODIFIED
+// upstream kube-scheduler Filter plugins against concrete nodes — no plugin fork.
+// After the bind/provision split, PotentialNodes never reach the framework, so the
+// framework only ever filters concrete nodes and can use stock plugins verbatim.
+func TestBindPath_UsesStockPlugins(t *testing.T) {
+	ctx := context.Background()
+	f := newMarginalCostFramework() // wraps stock nodeaffinity + tainttoleration
+
+	// A node labeled arch=amd64; a pod that REQUIRES arch=arm64 must be rejected
+	// by the stock NodeAffinity plugin (not a reimplementation).
+	node := makeConcreteNodeInfo("amd64-node", 8, 32, map[string]string{
+		"kubernetes.io/arch": "amd64",
+	})
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "needs-arm", Namespace: "default"},
+		Spec: v1.PodSpec{
+			Affinity: &v1.Affinity{NodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{{
+						MatchExpressions: []v1.NodeSelectorRequirement{{
+							Key:      "kubernetes.io/arch",
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{"arm64"},
+						}},
+					}},
+				},
+			}},
+		},
 	}
 
-	// Create a PotentialNode with two instance types
+	if status := f.RunFilterPlugins(ctx, framework.NewCycleState(), pod, node); status.IsSuccess() {
+		t.Fatal("stock NodeAffinity should reject arm64-required pod on an amd64 node")
+	}
+
+	// A pod that tolerates nothing must be rejected from a tainted node by the
+	// stock TaintToleration plugin.
+	tainted := makeConcreteNodeInfo("tainted", 8, 32, nil)
+	tainted.(*testNodeInfo).node.Spec.Taints = []v1.Taint{{
+		Key: "dedicated", Value: "gpu", Effect: v1.TaintEffectNoSchedule,
+	}}
+	plain := makePod("no-tolerations", 2, 2048)
+	if status := f.RunFilterPlugins(ctx, framework.NewCycleState(), plain, tainted); status.IsSuccess() {
+		t.Fatal("stock TaintToleration should reject an untolerating pod from a NoSchedule-tainted node")
+	}
+
+	t.Logf("PASS: bind path filters concrete nodes with unmodified upstream plugins (no fork)")
+}
+
+// TestProvisionPath_NarrowsSuperposition verifies the provisioning path narrows a
+// PotentialNode directly via NarrowForPod — NOT through the framework. This is the
+// piece that will move to a PostFilter provisioning plugin; it operates on the
+// instance-type superposition, which a concrete Filter plugin cannot represent.
+func TestProvisionPath_NarrowsSuperposition(t *testing.T) {
 	instanceTypes := []*capacity.InstanceType{
 		makeCapacityInstanceType("m5.xlarge", 4, 16, []string{"us-west-2a", "us-west-2b"}, 0.096),
 		makeCapacityInstanceType("m5.2xlarge", 8, 32, []string{"us-west-2a", "us-west-2b"}, 0.192),
 	}
-
 	baseReqs := capacity.NewRequirements()
 	baseReqs[v1.LabelTopologyZone] = capacity.NewRequirement(v1.LabelTopologyZone, v1.NodeSelectorOpIn, "us-west-2a", "us-west-2b")
 	baseReqs[v1.LabelInstanceTypeStable] = capacity.NewRequirement(v1.LabelInstanceTypeStable, v1.NodeSelectorOpIn, "m5.xlarge", "m5.2xlarge")
-
 	pn := virtualnode.New(baseReqs, instanceTypes, nil)
 
-	// Pod requesting 6 CPU — only m5.2xlarge (8 CPU) can satisfy
+	// Pod requesting 6 CPU — only m5.2xlarge (8 CPU) can satisfy.
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "big-pod", Namespace: "default"},
 		Spec: v1.PodSpec{
@@ -63,135 +106,22 @@ func TestRealFramework_FilterPotentialNode(t *testing.T) {
 		},
 	}
 
-	// Run Filter through the real framework
-	state := framework.NewCycleState()
-	status := f.RunFilterPlugins(ctx, state, pod, pn)
-
-	if !status.IsSuccess() {
-		t.Fatalf("RunFilterPlugins failed: %v", status.Message())
+	if status := pn.NarrowForPod(pod); !status.IsSuccess() {
+		t.Fatalf("NarrowForPod failed: %v", status.Message())
+	}
+	if len(pn.InstanceTypes) != 1 || pn.InstanceTypes[0].Name != "m5.2xlarge" {
+		t.Fatalf("expected superposition narrowed to m5.2xlarge, got %d types", len(pn.InstanceTypes))
 	}
 
-	// After Filter, PotentialNode should have narrowed: m5.xlarge (4 CPU) eliminated
-	if len(pn.InstanceTypes) != 1 {
-		t.Fatalf("expected 1 instance type after narrowing, got %d", len(pn.InstanceTypes))
-	}
-	if pn.InstanceTypes[0].Name != "m5.2xlarge" {
-		t.Fatalf("expected m5.2xlarge to remain, got %s", pn.InstanceTypes[0].Name)
-	}
-
-	t.Logf("PASS: Real framework Filter narrowed PotentialNode: 2 types → 1 (%s)", pn.InstanceTypes[0].Name)
-}
-
-// TestRealFramework_FilterConcreteNode verifies concrete nodes still work through our plugins.
-func TestRealFramework_FilterConcreteNode(t *testing.T) {
-	ctx := context.Background()
-
-	f, err := frameworkruntime.NewFramework(ctx, makeTestRegistry(),
-		makeTestProfile(plugins.NodeResourcesFitUnifiedName, plugins.TaintTolerationUnifiedName))
-	if err != nil {
-		t.Fatalf("NewFramework failed: %v", err)
+	// A taint the pod doesn't tolerate rejects the whole superposition.
+	tainted := virtualnode.New(baseReqs, instanceTypes, []v1.Taint{{
+		Key: "dedicated", Value: "gpu", Effect: v1.TaintEffectNoSchedule,
+	}})
+	if status := tainted.NarrowForPod(makePod("untolerating", 2, 2048)); status.IsSuccess() {
+		t.Fatal("NarrowForPod should reject a pod that doesn't tolerate the NodePool taint")
 	}
 
-	node := makeConcreteNodeInfo("concrete-1", 4, 16, map[string]string{
-		v1.LabelTopologyZone: "us-west-2a",
-	})
-
-	// Pod that fits (2 CPU)
-	podFits := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "small-pod", Namespace: "default"},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{{
-				Name: "main",
-				Resources: v1.ResourceRequirements{
-					Requests: v1.ResourceList{
-						v1.ResourceCPU:    resource.MustParse("2"),
-						v1.ResourceMemory: resource.MustParse("4Gi"),
-					},
-				},
-			}},
-		},
-	}
-
-	state := framework.NewCycleState()
-	status := f.RunFilterPlugins(ctx, state, podFits, node)
-	if !status.IsSuccess() {
-		t.Fatalf("expected small pod to fit, got: %v", status.Message())
-	}
-
-	// Pod too big (8 CPU on 4 CPU node)
-	podBig := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "big-pod", Namespace: "default"},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{{
-				Name: "main",
-				Resources: v1.ResourceRequirements{
-					Requests: v1.ResourceList{
-						v1.ResourceCPU:    resource.MustParse("8"),
-						v1.ResourceMemory: resource.MustParse("4Gi"),
-					},
-				},
-			}},
-		},
-	}
-
-	state2 := framework.NewCycleState()
-	status2 := f.RunFilterPlugins(ctx, state2, podBig, node)
-	if status2.IsSuccess() {
-		t.Fatal("expected big pod to NOT fit (8 CPU > 4 CPU)")
-	}
-
-	t.Logf("PASS: Real framework Filter correctly passes/rejects concrete nodes")
-}
-
-// noopBind satisfies the required Bind extension point.
-type noopBind struct{}
-
-func (noopBind) Name() string { return "NoopBind" }
-func (noopBind) Bind(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ string) *fwk.Status {
-	return nil
-}
-
-// makeTestRegistry builds a registry with our unified plugins + required infrastructure.
-func makeTestRegistry() frameworkruntime.Registry {
-	return frameworkruntime.Registry{
-		"PrioritySort": func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
-			return &queuesort.PrioritySort{}, nil
-		},
-		"NoopBind": func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
-			return &noopBind{}, nil
-		},
-		plugins.NodeResourcesFitUnifiedName: func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
-			return &plugins.NodeResourcesFitUnified{}, nil
-		},
-		plugins.NodeAffinityUnifiedName: func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
-			return &plugins.NodeAffinityUnified{}, nil
-		},
-		plugins.TaintTolerationUnifiedName: func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
-			return &plugins.TaintTolerationUnified{}, nil
-		},
-	}
-}
-
-// makeTestProfile builds a profile with QueueSort + Bind + our Filter plugins.
-func makeTestProfile(filterPlugins ...string) *config.KubeSchedulerProfile {
-	filters := make([]config.Plugin, len(filterPlugins))
-	for i, name := range filterPlugins {
-		filters[i] = config.Plugin{Name: name}
-	}
-	return &config.KubeSchedulerProfile{
-		SchedulerName: "unified-poc",
-		Plugins: &config.Plugins{
-			QueueSort: config.PluginSet{
-				Enabled: []config.Plugin{{Name: "PrioritySort"}},
-			},
-			Filter: config.PluginSet{
-				Enabled: filters,
-			},
-			Bind: config.PluginSet{
-				Enabled: []config.Plugin{{Name: "NoopBind"}},
-			},
-		},
-	}
+	t.Logf("PASS: provision path narrowed superposition (2 types → 1) and enforced taints, no framework")
 }
 
 // helper to create instance types for framework tests

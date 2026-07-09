@@ -103,11 +103,56 @@ func (pn *PotentialNode) GetAllocatable() fwk.Resource {
 
 func (pn *PotentialNode) Snapshot() fwk.NodeInfo { return pn }
 
+// Clone returns a deep-enough copy for independent narrowing: the requirements map
+// and instance-type/pod slices are copied so a caller can narrow the clone without
+// mutating the original. Instance types and pods themselves are shared by pointer
+// (they are immutable within a solve). Used by search solvers (ILP) that explore
+// sibling assignments from a common prefix without cross-contamination.
+func (pn *PotentialNode) Clone() *PotentialNode {
+	reqs := capacity.NewRequirements()
+	for k, r := range pn.Requirements {
+		reqs[k] = r.Copy()
+	}
+	types := append([]*capacity.InstanceType(nil), pn.InstanceTypes...)
+	pods := append([]fwk.PodInfo(nil), pn.pods...)
+	return &PotentialNode{
+		Requirements:  reqs,
+		InstanceTypes: types,
+		Taints:        pn.Taints,
+		pods:          pods,
+		hostname:      pn.hostname,
+		generation:    pn.generation,
+	}
+}
+
 func (pn *PotentialNode) AddPodInfo(podInfo fwk.PodInfo) {
 	pn.pods = append(pn.pods, podInfo)
 	pn.generation++
 	pn.representative = nil
 }
+
+// AddPod records a pod on the claim via a minimal PodInfo wrapper. It lets callers
+// that don't build framework PodInfos (e.g. the pure solver package) place a pod
+// without depending on the scheduler framework.
+func (pn *PotentialNode) AddPod(pod *v1.Pod) {
+	pn.AddPodInfo(minimalPodInfo{pod: pod})
+}
+
+// minimalPodInfo is a bare fwk.PodInfo wrapping a pod. The provisioning solver only
+// ever reads GetPod(); the precomputed-affinity accessors return empty because
+// affinity narrowing is handled by Narrowers, not read off PodInfo here.
+type minimalPodInfo struct{ pod *v1.Pod }
+
+func (m minimalPodInfo) GetPod() *v1.Pod                                  { return m.pod }
+func (m minimalPodInfo) GetRequiredAffinityTerms() []fwk.AffinityTerm     { return nil }
+func (m minimalPodInfo) GetRequiredAntiAffinityTerms() []fwk.AffinityTerm { return nil }
+func (m minimalPodInfo) GetPreferredAffinityTerms() []fwk.WeightedAffinityTerm {
+	return nil
+}
+func (m minimalPodInfo) GetPreferredAntiAffinityTerms() []fwk.WeightedAffinityTerm {
+	return nil
+}
+func (m minimalPodInfo) CalculateResource() fwk.PodResource { return fwk.PodResource{} }
 
 func (pn *PotentialNode) RemovePod(logger klog.Logger, pod *v1.Pod) error {
 	for i, p := range pn.pods {
@@ -128,8 +173,168 @@ func (pn *PotentialNode) SetNode(node *v1.Node) {}
 // Hostname returns the stable placeholder hostname.
 func (pn *PotentialNode) Hostname() string { return pn.hostname }
 
-// Narrow intersects requirements and filters instance types. Called by
-// PotentialNode-aware plugins as a side effect of Filter.
+// Narrower is the constraint plugin surface for provisioning (the Filter-analog).
+// Each Narrower prunes a PotentialNode's option set by one constraint. Narrowers
+// are CONJUNCTIVE — the solver applies all registered hard Narrowers, intersected —
+// which is why removing a constraint (e.g. topology) is just "don't register its
+// Narrower": the claim stays wider, nothing else changes. This is the ecosystem
+// extensibility surface; solvers consult it, they do not contain the constraints.
+type Narrower interface {
+	Name() string
+	// Narrow prunes claim by this constraint for pod. A non-success Status means
+	// the pod cannot join the claim under this constraint (e.g. the option set went
+	// empty, or a taint is untolerated).
+	Narrow(pod *v1.Pod, claim *PotentialNode) *fwk.Status
+	// Hard reports whether the solver MUST apply this Narrower (true) or MAY apply
+	// it, deciding by what the narrowing costs against the offerings (false — a soft
+	// preference). Soft Narrowers are how "narrow-on-score" works with no Score term.
+	Hard() bool
+}
+
+// DefaultNarrowers is the built-in hard-constraint set every solver applies. There
+// is ONE Narrower per corresponding kube-scheduler Filter plugin — the Narrow
+// surface is the provisioning-side analog of Filter, so it mirrors those plugins
+// one-to-one (same names, same semantics) rather than fusing them:
+//
+//	kube-scheduler Filter   →   Narrower
+//	  TaintToleration       →   TaintTolerationNarrower
+//	  NodeAffinity          →   NodeAffinityNarrower
+//	  NodeResourcesFit      →   NodeResourcesFitNarrower
+//
+// Registering more (e.g. a topology Narrower) extends the scheduler; omitting one
+// relaxes that constraint fleet-wide (the "delete the Filter plugin" property).
+func DefaultNarrowers() []Narrower {
+	return []Narrower{
+		TaintTolerationNarrower{},
+		NodeAffinityNarrower{},
+		NodeResourcesFitNarrower{},
+	}
+}
+
+// NarrowForPod applies the given Narrowers to the superposition in order (hard ones
+// unconditionally; soft ones are left to the solver, so this only applies hard).
+// It is the provisioning-side analog of running the concrete Filter plugins, but it
+// operates on the superposition directly (no framework — a PotentialNode is not a
+// concrete NodeInfo). With no Narrowers passed, it applies DefaultNarrowers.
+//
+// Returns a non-success Status if any hard Narrower rejects the pod.
+func (pn *PotentialNode) NarrowForPod(pod *v1.Pod, narrowers ...Narrower) *fwk.Status {
+	if len(narrowers) == 0 {
+		narrowers = DefaultNarrowers()
+	}
+	for _, n := range narrowers {
+		if !n.Hard() {
+			continue // soft Narrowers are the solver's option, not applied here
+		}
+		if status := n.Narrow(pod, pn); !status.IsSuccess() {
+			return status
+		}
+	}
+	return nil
+}
+
+// TaintTolerationNarrower is the Narrow analog of the TaintToleration Filter: it
+// rejects a pod that doesn't tolerate the claim's (NodePool) NoSchedule/NoExecute
+// taints. The superposition shares one taint set (all a source's offerings carry
+// the same NodePool taints), so this rejects the whole claim rather than narrowing.
+type TaintTolerationNarrower struct{}
+
+func (TaintTolerationNarrower) Name() string { return "TaintToleration" }
+func (TaintTolerationNarrower) Hard() bool   { return true }
+func (TaintTolerationNarrower) Narrow(pod *v1.Pod, claim *PotentialNode) *fwk.Status {
+	return toleratesTaints(pod.Spec.Tolerations, claim.Taints)
+}
+
+// NodeAffinityNarrower is the Narrow analog of the NodeAffinity Filter: it narrows
+// the option set by the pod's hard label requirements (nodeSelector + required
+// node-affinity In-terms). Where the Filter accepts/rejects one fixed node, the
+// Narrower intersects the requirement across the superposition, dropping instance
+// types whose labels can't satisfy it.
+type NodeAffinityNarrower struct{}
+
+func (NodeAffinityNarrower) Name() string { return "NodeAffinity" }
+func (NodeAffinityNarrower) Hard() bool   { return true }
+func (NodeAffinityNarrower) Narrow(pod *v1.Pod, claim *PotentialNode) *fwk.Status {
+	if err := claim.Narrow(podHardRequirements(pod), nil); err != nil {
+		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, err.Error())
+	}
+	return nil
+}
+
+// NodeResourcesFitNarrower is the Narrow analog of the NodeResourcesFit Filter: it
+// drops instance types that can't hold the claim's cumulative resource requests
+// (this pod plus those already placed). The Filter checks one node's allocatable;
+// the Narrower checks each surviving instance type's allocatable.
+type NodeResourcesFitNarrower struct{}
+
+func (NodeResourcesFitNarrower) Name() string { return "NodeResourcesFit" }
+func (NodeResourcesFitNarrower) Hard() bool   { return true }
+func (NodeResourcesFitNarrower) Narrow(pod *v1.Pod, claim *PotentialNode) *fwk.Status {
+	if err := claim.Narrow(nil, podResourceRequests(pod)); err != nil {
+		return fwk.NewStatus(fwk.Unschedulable, err.Error())
+	}
+	return nil
+}
+
+// toleratesTaints reports success only if every NoSchedule/NoExecute taint is
+// tolerated. Mirrors the taint check the concrete TaintToleration plugin applies.
+func toleratesTaints(tolerations []v1.Toleration, taints []v1.Taint) *fwk.Status {
+	for i := range taints {
+		taint := taints[i]
+		if taint.Effect != v1.TaintEffectNoSchedule && taint.Effect != v1.TaintEffectNoExecute {
+			continue
+		}
+		tolerated := false
+		for _, tol := range tolerations {
+			if tol.ToleratesTaint(klog.TODO(), &taint, false) {
+				tolerated = true
+				break
+			}
+		}
+		if !tolerated {
+			return fwk.NewStatus(fwk.UnschedulableAndUnresolvable,
+				fmt.Sprintf("untolerated taint %s=%s:%s", taint.Key, taint.Value, taint.Effect))
+		}
+	}
+	return nil
+}
+
+// podHardRequirements extracts a pod's hard label constraints (nodeSelector plus
+// requiredDuringScheduling node-affinity In-terms) as capacity.Requirements. Only
+// In is handled (the POC scope); other operators are ignored for narrowing.
+func podHardRequirements(pod *v1.Pod) capacity.Requirements {
+	reqs := capacity.NewRequirements()
+	for key, value := range pod.Spec.NodeSelector {
+		reqs[key] = capacity.NewRequirement(key, v1.NodeSelectorOpIn, value)
+	}
+	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
+		if required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; required != nil {
+			for _, term := range required.NodeSelectorTerms {
+				for _, expr := range term.MatchExpressions {
+					if expr.Operator == v1.NodeSelectorOpIn {
+						reqs[expr.Key] = capacity.NewRequirement(expr.Key, expr.Operator, expr.Values...)
+					}
+				}
+			}
+		}
+	}
+	return reqs
+}
+
+// podResourceRequests sums a pod's container resource requests.
+func podResourceRequests(pod *v1.Pod) v1.ResourceList {
+	total := make(v1.ResourceList)
+	for _, c := range pod.Spec.Containers {
+		for name, qty := range c.Resources.Requests {
+			existing := total[name]
+			existing.Add(qty)
+			total[name] = existing
+		}
+	}
+	return total
+}
+
+// Narrow intersects requirements and filters instance types.
 func (pn *PotentialNode) Narrow(podReqs capacity.Requirements, podRequests v1.ResourceList) error {
 	narrowed := capacity.NewRequirements()
 	narrowed.Add(pn.Requirements)
@@ -175,7 +380,9 @@ func (pn *PotentialNode) CumulativeRequestsWith(additional v1.ResourceList) v1.R
 	return total
 }
 
-// CheapestPrice returns the lowest offering price among compatible, available offerings.
+// CheapestPrice returns the lowest EFFECTIVE offering price among compatible,
+// available offerings. Effective price folds in performance-value (offering data),
+// so this is the number the cost axis compares — no separate cost/score term.
 func (pn *PotentialNode) CheapestPrice() float64 {
 	cheapest := float64(0)
 	first := true
@@ -187,8 +394,8 @@ func (pn *PotentialNode) CheapestPrice() float64 {
 			if !pn.Requirements.Compatible(o.Requirements) {
 				continue
 			}
-			if first || o.Price < cheapest {
-				cheapest = o.Price
+			if ep := o.EffectivePrice(); first || ep < cheapest {
+				cheapest = ep
 				first = false
 			}
 		}
@@ -206,9 +413,9 @@ func (pn *PotentialNode) CheapestInstanceType() *capacity.InstanceType {
 			if !o.Available || !pn.Requirements.Compatible(o.Requirements) {
 				continue
 			}
-			if first || o.Price < bestPrice {
+			if ep := o.EffectivePrice(); first || ep < bestPrice {
 				best = it
-				bestPrice = o.Price
+				bestPrice = ep
 				first = false
 			}
 			break

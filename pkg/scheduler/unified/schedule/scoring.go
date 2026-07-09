@@ -283,8 +283,10 @@ func cheapestOfferingPrice(reqs capacity.Requirements, types []*capacity.Instanc
 			if !off.Available || !reqs.Compatible(off.Requirements) {
 				continue
 			}
-			if !found || off.Price < price {
-				price, found = off.Price, true
+			// EffectivePrice folds in performance-value (offering data), so a
+			// better-but-equally-priced offering wins the cost axis with no scoring term.
+			if ep := off.EffectivePrice(); !found || ep < price {
+				price, found = ep, true
 			}
 		}
 	}
@@ -302,8 +304,8 @@ func cheapestTypeAndPrice(reqs capacity.Requirements, types []*capacity.Instance
 			if !off.Available || !reqs.Compatible(off.Requirements) {
 				continue
 			}
-			if !found || off.Price < price {
-				best, price, found = it, off.Price, true
+			if ep := off.EffectivePrice(); !found || ep < price {
+				best, price, found = it, ep, true
 			}
 		}
 	}

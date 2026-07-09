@@ -3,7 +3,7 @@
 **Last updated:** 2026-06-26
 **Scope:** the unified scheduling POC in this `pkg/scheduler/unified/` package — a single function that evaluates binding to existing nodes, provisioning new ones, and consolidation on one cost axis.
 
-This doc records the **major design questions** the POC has taken a stance on (D1–D16), with the rationale and status of each, plus the **open questions** (O1–O6) still undecided. It is the reader's-digest entry point for the design.
+This doc records the **major design questions** the POC has taken a stance on (D1–D19), with the rationale and status of each, plus the **open questions** (O1–O7) still undecided. It is the reader's-digest entry point for the design.
 
 Each decision entry: **Stance** what was decided, **Why** the reasoning, **Status** built / designed / decided-not-built / changed-my-mind. The "Open Design Questions" section at the end holds the live forks — things still genuinely undecided, not stances.
 
@@ -32,22 +32,24 @@ flowchart TB
 
     subgraph engine["solve(view, pods, offerings, opts) — pure, no I/O"]
         direction TB
-        loop["per pod, largest-first:<br/>PreFilter → Filter → expand → score → argmin(effectiveCost)<br/>candidates = existing nodes ∪ in-flight claims ∪ {dummy}<br/>commit winner into the view; topology injected up front, recorded on pin"]
+        loop["per pod, largest-first:<br/>1. feasible bind? → BIND (tier 0, cost ~0) — decided first, not scored against provisioning<br/>2. else provision/preempt follow-up: expand → score → argmin(effectiveCost)<br/>candidates = existing nodes ∪ NodeClaim-nominated in-flight ∪ {dummy}<br/>commit winner into the view; topology injected up front, recorded on pin"]
     end
     solve["solve()"] --> engine
 
-    plugins["kube-scheduler framework plugins<br/>(modified — PotentialNode-aware)<br/>NodeResourcesFitUnified · NodeAffinityUnified · TaintTolerationUnified"]
-    scorers["scorers<br/>price · flexibility · preference"]
+    plugins["STOCK kube-scheduler Filter plugins<br/>(unmodified — bind path only)<br/>NodeAffinity · TaintToleration · NodeResourcesFit"]
+    narrow["PotentialNode.NarrowForPod<br/>(provisioning path — no framework)<br/>taints + requirements + resources"]
+    scorers["scorers<br/>price · flexibility"]
     snap["Snapshot (immutable base)<br/>+ per-solve view (COW overlay)"]
 
-    plugins -->|"Filter: narrows superposition as a side effect"| engine
+    plugins -->|"Filter concrete nodes (bind)"| engine
+    narrow -->|"narrow superposition (provision)"| engine
     scorers -->|"effectiveCost"| engine
     snap <-->|"reads / tentative writes"| engine
 
     engine -->|"Result{Bindings, NodeClaims, Preemptions}"| callers
 ```
 
-Key shapes the diagram encodes (each a decision below): `solve()` is the single engine both entry points share (D2, D11); it's a **pure function** that returns a plan and never executes (D13); the caller owns batch composition / execution / failure handling (D14); feasibility comes from **real framework plugins** mutated to narrow superpositions, while the cost decision is the **scorer `argmin`** (D2, D7); cluster state is an **immutable Snapshot + per-solve view** (D10); and `Deschedule` is just `solve` over a node-removed view (D11).
+Key shapes the diagram encodes (each a decision below): `solve()` is the single engine both entry points share (D2, D11); it's a **pure function** that returns a plan and never executes (D13); the caller owns batch composition / execution / failure handling (D14); the **bind path filters concrete nodes with stock (unmodified) kube-scheduler plugins** while the **provisioning path narrows superpositions via `NarrowForPod`** off the framework (D19), with the cost decision as the **scorer `argmin`** (D2, D7); cluster state is an **immutable Snapshot + per-solve view** (D10); and `Deschedule` is just `solve` over a node-removed view (D11).
 
 ---
 
@@ -68,14 +70,14 @@ Everything below reduces to two commitments:
 - **Status:** Decided; reflected in default `Schedule()` behavior (bind-first).
 
 ### D2. How do bind / provision / pack-onto-in-flight compete?
-- **Stance:** One marginal-cost axis, `argmin`, ties broken by tier (`existing < in-flight < dummy`).
-- **Why:** Karpenter hard-codes the `existing → in-flight → new` ordering; here it *falls out* of marginal cost (existing ≈ 0 ≤ in-flight delta ≤ a whole new node) rather than being a gate. Real nodes win ties (no launch latency, no stockout risk).
-- **Status:** Built (three-tier candidate model in `solve()`).
+- **Stance:** One marginal-cost axis, `argmin`, ties broken by tier (`existing < in-flight < dummy`) — but **bind is decided first, not scored against provisioning** (see D17). A pod with a feasible bind takes tier 0 (cost ~0) and never enters the provisioning competition; only the unschedulable remainder is scored across in-flight and dummy tiers.
+- **Why:** Karpenter hard-codes the `existing → in-flight → new` ordering; here it *falls out* of marginal cost (existing ≈ 0 ≤ in-flight delta ≤ a whole new node) rather than being a gate. Because binding retained capacity is ~$0 and provisioning is always >$0 (D1), bind always wins when feasible — so scoring it against provisioning re-derives a known answer at full catalog-width cost. Bind-first factors that out (D17); the in-flight tier is NodeClaim-nominated capacity tracked by the nominator (D18), not a batch-local structure. Real nodes still win ties (no launch latency, no stockout risk).
+- **Status:** Three-tier candidate model built in `solve()`. Bind-first factoring (D17) **built** — `solve()` short-circuits to a bind when any existing node is feasible and only then builds/scores the in-flight+dummy tiers. NodeClaim-nominated in-flight tier (D18) remains decided-design (needs the caller/queue machinery in O7).
 
 ### D3. Is preemption a special phase?
-- **Stance:** No — preemption is **deferred provisioning**: a candidate scored at `marginalCost(re-place victim) + disruption`.
-- **Why:** The evicted victim rebounds and must itself be placed (usually a new node), so preemption ≈ provisioning + disruption. Provisioning Pareto-dominates it unless the victim is disposable or provisioning is impossible (quota/stockout).
-- **Status:** Designed, not built.
+- **Stance:** Preemption is **deferred provisioning** — a candidate scored at `marginalCost(re-place victim) + disruption` — but, like provisioning, it is a **follow-up decision reached only for the unschedulable remainder** (a pod with no feasible bind), not a per-pod peer of binding.
+- **Why:** The evicted victim rebounds and must itself be placed (usually a new node), so preemption ≈ provisioning + disruption. Provisioning Pareto-dominates it unless the victim is disposable or provisioning is impossible (quota/stockout). Gating it behind "no feasible bind" *is* kube-scheduler's PostFilter escape-hatch trigger (`schedule_one.go` drives `Preempt()` only after Filter fails everywhere) — bind-first (D17) restores that trigger, which bounds the recursive-displacement cost (O5) to the remainder instead of evaluating preemption for every pod.
+- **Status:** Designed, not built. Preemption and provisioning compete *with each other* in the follow-up `argmin`; bind is not in that competition.
 
 *(D4 was "what is the unifying principle?" — merged into meta-stance #1 above, since it's the principle D1–D3 share, not a separate fork. D-numbers D5+ are left unchanged to keep existing references stable.)*
 
@@ -147,14 +149,42 @@ Everything below reduces to two commitments:
 - **Status:** Resolved; demonstrated by the caller harness (transient-recovers, persistent-isolated, fixed-capacity-on-relaunch).
 
 ### D15. What is the commit boundary for binds vs. provisioning?
-- **Stance:** Binds can stay **per-pod-committed and re-decidable** via re-batching; an **emitted NodeClaim is the one real external commit** that the next batch must fold in as *fixed in-flight capacity* (not reopen).
-- **Why:** Backoff cleanly handles pod retries but cannot un-launch a node. So the binds-vs-provisioning asymmetry is real: binds are cheap to redo, provisioning commits are not.
-- **Status:** Resolved (design); the "fold emitted NodeClaims as fixed capacity" behavior is demonstrated by the harness.
+- **Stance:** Binds stay **per-pod-committed and re-decidable** via re-batching. New capacity is committed by **nominating the pod to its NodeClaim** (D18): the NodeClaim is a live in-flight candidate the moment it's created, and the pod self-promotes to a real bind once the node registers — rather than the batch being "folded into the next tick as fixed capacity."
+- **Why:** Backoff cleanly handles pod retries but cannot un-launch a node, so the binds-vs-provisioning asymmetry is real. Nominate-to-NodeClaim keeps that asymmetry while making in-flight capacity influence decisions *within* the running decision stream (pod N packs onto the NodeClaim pod M just opened), not merely on the next tick. This is Karpenter's in-flight NodeClaim expressed in the scheduler's native nomination vocabulary.
+- **Status:** Superseded by D18. (The earlier "fold emitted NodeClaims as fixed capacity" behavior in the harness is the weaker cross-tick version; nominate-to-NodeClaim replaces it.)
 
 ### D16. One pipeline, or one library with two callers?
-- **Stance (directional):** **(B) one library / two callers** as the migration path; **(A) one async-commit pipeline** as the destination.
-- **Why:** The fast bind path (~ms) and slow provision path (~min, external) have different latency models. (B) — kube-scheduler calls the core with `offerings=∅` (pure binding), Karpenter with the full catalog (provisioning) — is lower-risk and is already the shape `Schedule()` has. (A) collapses them once async-commit is proven.
-- **Status:** Directional; current `Schedule()` is the (B) shape.
+- **Stance:** **(B) one library / two callers** is the migration path; **(A) one async-commit pipeline** is the destination — and bind-first + nominate-to-NodeClaim (D17/D18) *is* the concrete realization of (A). The async commit is the self-promotion of a nominated pod, built on machinery the scheduler already has (the nominator, node-add requeue).
+- **Why:** The fast bind path (~ms) and slow provision path (~min, external) have different latency models. (B) — kube-scheduler calls the core with `offerings=∅` (pure binding), Karpenter with the full catalog (provisioning) — is lower-risk and is already the shape `Schedule()` has. Bind-first preserves the fast path exactly (stock per-pod cycle) while nomination provides the async commit for the slow path, so (A) is no longer a separate rewrite — it's what D17/D18 describe.
+- **Status:** (B) is the current `Schedule()` shape; (A) is specified by D17/D18, code reconciliation pending.
+
+---
+
+## Bind-first & nominate-to-NodeClaim
+
+*(Origin: SDA meeting 2026-06-30 + Karpenter Working Group 2026-07-02 on [PR #1](https://github.com/DerekFrank/kubernetes/pull/1). Dominik: "always bind, then preempt/provision as a follow-up decision." These resolve the batch-vs-latency tension D15/D16 left open — the pipeline **shape** changes; the cost model does not.)*
+
+### D17. Is binding scored against provisioning, or decided first?
+- **Stance:** **Decided first.** A pod with a feasible bind to retained capacity binds immediately, per-pod, via the stock kube-scheduler cycle — it is never scored against provisioning/preemption. Only the **unschedulable remainder** (no feasible bind) enters the batched provision/preempt follow-up.
+- **Why:** This is D1's theorem hoisted out of the inner loop — binding retained capacity is ~$0, provisioning is always >$0, so bind *always* wins when feasible. Scoring provisioning for a bindable pod pays full catalog-width cost (O1) to rediscover a known answer. Bind-first is not a retreat from the unified model — it is the unified `argmin` *factored*: bind resolves to the trivial tier and is decided first; provision and preempt still compete on the one marginal-cost axis, over a much smaller set. Consequences: (1) catalog-width cost (O1) collapses to the remainder — the common path stays at stock-kube-scheduler parity; (2) the bind hot path keeps stock kube-scheduler wholesale (pure Filter, `percentageOfNodesToScore` sampling, per-pod incremental commit, `[0,100]` scoring) — superposition/narrowing only happens in the follow-up; (3) it restores kube-scheduler's preemption trigger (D3).
+- **What's given up (and why it survives):** bind no longer joins a *global* joint optimization ("bind A here so B packs better later") — which is NP-hard and which neither the greedy POC nor Karpenter nor kube-scheduler attempts. That case is handled by the background consolidation/`Deschedule` loop (D11): **bind-first + consolidation ≈ the unified outcome, reached incrementally.**
+- **Does this re-create the scheduler/autoscaler split Gluon exists to kill?** No. Today's split hurts because the two systems run on divergent, informer-lagged state *and* provision/preempt don't coordinate. Bind-first keeps one library, one shared snapshot/derived-index, and provision+preempt unified in the follow-up. What's separated is *timing* (bind now, provision as follow-up), not *state* or *decision axis*.
+- **Status:** **Built.** `solve()` collects feasible existing nodes (Filter + view-based resource fit + topology check) and, if any is feasible, binds immediately and `continue`s — the in-flight/dummy tiers, expanders, and scorers are constructed only for the unschedulable remainder. Verified: `TestSchedule_BindFirstBeatsCreditedProvisioning` (a free bind wins even when the packing credit drives a provisioning candidate's effective cost negative — bind-first is a *selection rule*, not a tie-break), plus the whole existing suite still green. Empirical O1 payoff in `BenchmarkComparison`: the many-offerings (500-type) column dropped from ~597/2911/5778 ms (100/500/1000 pods) to ~0.56/13.8/49 ms — parity with no-offerings, because bindable pods never expand the catalog.
+  - **Not-yet-reconciled (still single-pass-shaped):** the bind step picks the *first* feasible node in snapshot order (all are marginal-cost 0); a production path scores feasible binds via the stock framework Score plugins. And among the remainder, provision is built but **preemption is not** (D3) — so today the remainder yields only NodeClaims/errors, never evictions.
+
+### D18. How is a pod committed to new (not-yet-existing) capacity?
+- **Stance:** **Nominate the pod to its NodeClaim; the pod self-promotes to a bind when the node is ready.** The follow-up does not bind a provisioned pod (no node exists yet) — it creates the NodeClaim and nominates the pod to it, the provisioning analog of preemption's nominate-to-node. When the NodeClaim resolves to a real Node, the pod's next cycle finds a feasible real node and binds normally; the nomination clears. No orchestrator watches for "node exists, now bind" — the pod promotes itself.
+- **Why:** Nomination makes the NodeClaim a **first-class in-flight candidate the moment it's created**, so later decisions build on earlier ones (pod 5 packs onto the NodeClaim pod 1 opened) — the D2 tiers work *within* the decision stream, not just across ticks (the weaker D15 fold-into-next-batch). The mechanism already exists: the nominator is a plain string-keyed map that does **not** require the node to exist (`backend/queue/nominator.go` — `nominatedPods map[string][]podRef`, `nominatedPodToNode map[types.UID]string`), and the scheduler already nominates toward not-yet-bound capacity to inform the autoscaler (`schedule_one.go` — "Add NominatedNodeName to tell the external components (e.g., the cluster autoscaler) that the pod is about to be bound"). D18 generalizes the nomination *target* from Node to NodeClaim.
+- **State machine (shared with preemption):** decide → nominate → (reality catches up) → bind → nomination clears. Preemption's "reality" is victims draining; provisioning's is the NodeClaim → Node registration (a node-add event → existing requeue). Failure is per-item, never a batch rollback — consistent with D14: bind fails → back off one pod; eviction fails → re-activate preemptor (`framework/preemption/executor.go` `Activate`); NodeClaim never launches → TTL clears the nomination and re-activates the pod. Nothing is "thrown out," because the follow-up emitted intents, not binds.
+- **The batch is a *planning* unit, never an *actuation* unit.** The follow-up emits only intents — NodeClaim creates + nominations (cheap), async evictions — and binds nothing. Every latency-bearing mutating call (bind, eviction, DRA `Reserve`/`PreBind`) happens downstream, per-item, async — exactly where kube-scheduler already puts them (`go sched.runBindingCycle`, KEP-4832 async preemption). This is why provisioning can batch (packing is a set operation) without actioning binds on the batch, and why nothing is "thrown out" on failure.
+- **API:** for the POC, **overload `pod.Status.NominatedNodeName`** to carry a NodeClaim reference (zero API change, reuses the nominator/requeue path). The **KEP proposes a dedicated `NominatedNodeClaimName`** — overloading conflates Node vs. NodeClaim referents for consumers (cluster-autoscaler reads `NominatedNodeName` as a node today); a distinct field makes the "committed to in-flight capacity that isn't a Node yet" state explicit and keeps the preemption (→Node) and provisioning (→NodeClaim) paths separable while sharing the nominator.
+- **Status:** Decided-design; not built. Open mechanics in O7.
+
+### D19. Do we fork the Filter/Score plugins to be PotentialNode-aware? *(changed my mind, now rebuilt)*
+- **Stance:** **No.** The bind path filters concrete nodes with **stock, unmodified kube-scheduler plugins**. The provisioning path narrows the superposition with a dedicated `PotentialNode.NarrowForPod` that runs **off the framework** entirely. The `*Unified` plugins (`NodeResourcesFitUnified`, `NodeAffinityUnified`, `TaintTolerationUnified`, `TopologySpreadUnified`) are **deleted**.
+- **Why:** The POC was originally built on the premise that a unified pass required *every* plugin to be taught about superpositions (type-assert `IsPotentialNode`, branch). Bind-first (D17) dissolves that premise: binding and provisioning are separate paths, so the framework only ever sees *concrete* nodes and can use upstream plugins verbatim — no fork, no divergence-from-upstream debt, no lossy representative fallback for un-migrated plugins. The narrowing logic that actually matters (Karpenter-style constraint intersection over the instance-type catalog) was never kube-scheduler plugin logic anyway; it belongs on the superposition type, not dressed as a `Filter`. This directly retires the biggest risk from the kube-scheduler design review ("modify every plugin" is the anti-pattern the framework's extensibility exists to avoid).
+- **Status:** **Built.** `plugins/noderesources_unified.go` deleted; `PotentialNode.NarrowForPod` (taints → requirements → resources) added; `solve()` calls the framework only for concrete nodes and `NarrowForPod` for potential ones. Tests `TestBindPath_UsesStockPlugins` (stock NodeAffinity/TaintToleration reject on a concrete node) and `TestProvisionPath_NarrowsSuperposition` (NarrowForPod collapses the type set + enforces taints) pin the split; suite green, `-race` clean. `NodeResourcesFit` is *not* wired into the bind path here because `solve()` does resource-fit against the COW view (which sees in-batch tentative placements the stock plugin's snapshot would miss) — a production embodiment would feed the view through the framework's snapshot lister and use the stock plugin.
+- **Next:** provisioning moves to a **PostFilter** plugin — `NarrowForPod` + the scorers become the body of a PostFilter that runs only when bind Filter fails everywhere, which is kube-scheduler's native "provision/preempt after no feasible bind" seam (see D3, D17). That is the last structural step to "stock scheduler + one PostFilter plugin," with zero changes to any existing plugin.
 
 ---
 
@@ -179,3 +209,6 @@ The cost-of-displacement principle (meta-stance #1) is recursive in theory, but 
 
 ### O6. RCU / incremental writer for cluster state
 The immutable base + COW view (D10) is the precondition; unbuilt is the atomic-pointer publish/swap and incremental, structure-shared writer-side updates so watch events produce new base versions cheaply (O(change), not a full rebuild per call). This is the "live, always-up-to-date cluster" piece.
+
+### O7. Nominate-to-NodeClaim mechanics (D18)
+The stance is decided; four mechanics are open. **(a) In-flight capacity accounting:** pods nominated to a NodeClaim must reserve its (still-superposed) capacity so the next pod packs into remaining headroom or opens a new claim, never double-books — `nominatedPodsForNode` does this for nodes today; ideally the nominator's reservation *is* the in-flight NodeClaim's accumulated requests-vs-capacity (the Filter narrowing side-effect), not a second bookkeeping copy. **(b) Claim→node identity:** the nominator keys on a string; nominate to the NodeClaim name at creation, then decide whether to rekey when it resolves to a Node or (simpler, leaning) keep the claim-name nomination and let the node-add event re-drive a fresh cycle that binds the real node and clears the claim nomination. **(c) Requeue on resolution:** ensure the NodeClaim→Node resolution emits a recognizable event / QueueingHint so nominated pods re-activate promptly rather than waiting for the `flushUnschedulablePodsLeftover` backstop. **(d) Stale-nomination TTL:** a NodeClaim that never launches (stockout/quota) must not strand its pod — a TTL/GC clears the nomination and re-activates the pod; decide whether the provisioner (reconciling its NodeClaims) or the queue's nominator owns it.

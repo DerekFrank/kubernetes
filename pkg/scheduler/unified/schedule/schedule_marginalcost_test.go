@@ -2,33 +2,48 @@ package schedule
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
 	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/plugins"
 )
 
-// marginalCostFramework is a minimal framework.Framework-shaped stub that runs
-// only our unified Filter plugins. It lets us drive the real Schedule() function
-// (not a test-helper reimplementation) while keeping PreFilter/Score as no-ops —
-// in this increment Schedule() selects purely on marginal cost.
+// marginalCostFramework is a minimal framework.Framework-shaped stub that runs the
+// STOCK kube-scheduler Filter plugins against concrete nodes. After the bind/
+// provision split, PotentialNodes never reach the framework — solve() narrows them
+// directly via PotentialNode.NarrowForPod — so the framework only ever sees
+// concrete nodes on the bind path. That means we can drive the real Schedule()
+// with unmodified upstream plugins (nodeaffinity, tainttoleration), proving the
+// binding path needs no plugin fork. NodeResourcesFit is intentionally omitted:
+// solve() does its resource-fit against the copy-on-write view (resourceFitsConcrete),
+// which sees tentative in-batch placements the stock plugin's snapshot would not.
 type marginalCostFramework struct {
 	framework.Framework
-	filters []filterPlugin
+	affinity fwk.FilterPlugin
+	taints   fwk.FilterPlugin
 }
 
 func newMarginalCostFramework() *marginalCostFramework {
+	aff, err := nodeaffinity.New(context.Background(), &config.NodeAffinityArgs{}, nil, feature.Features{})
+	if err != nil {
+		panic(fmt.Sprintf("nodeaffinity.New: %v", err))
+	}
+	taint, err := tainttoleration.New(context.Background(), nil, nil, feature.Features{})
+	if err != nil {
+		panic(fmt.Sprintf("tainttoleration.New: %v", err))
+	}
 	return &marginalCostFramework{
-		filters: []filterPlugin{
-			&plugins.NodeResourcesFitUnified{},
-			&plugins.NodeAffinityUnified{},
-			&plugins.TaintTolerationUnified{},
-		},
+		affinity: aff.(fwk.FilterPlugin),
+		taints:   taint.(fwk.FilterPlugin),
 	}
 }
 
@@ -37,10 +52,11 @@ func (f *marginalCostFramework) RunPreFilterPlugins(ctx context.Context, state f
 }
 
 func (f *marginalCostFramework) RunFilterPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
-	for _, p := range f.filters {
-		if s := p.Filter(ctx, state, pod, nodeInfo); s != nil && !s.IsSuccess() {
-			return s
-		}
+	if s := f.affinity.Filter(ctx, state, pod, nodeInfo); s != nil && !s.IsSuccess() {
+		return s
+	}
+	if s := f.taints.Filter(ctx, state, pod, nodeInfo); s != nil && !s.IsSuccess() {
+		return s
 	}
 	return nil
 }
@@ -108,6 +124,50 @@ func TestSchedule_ProvisionWhenNoFeasibleNode(t *testing.T) {
 			len(result.NodeClaims), len(result.Bindings), len(result.Errors))
 	}
 	t.Logf("PASS: provisioned a new node when the only existing node was full")
+}
+
+// TestSchedule_BindFirstBeatsCreditedProvisioning locks in D17: bind-first is a
+// SELECTION rule, not just a tie-break. A feasible bind must win even when a
+// provisioning candidate's effective cost has been driven *negative* by the
+// packing lookahead credit (score − credit < 0). Under the old
+// argmin-over-all-tiers, a large-enough credit could make an in-flight/dummy
+// node "cheaper than free" and beat the bind; bind-first forecloses that by never
+// scoring provisioning when any existing node is feasible.
+func TestSchedule_BindFirstBeatsCreditedProvisioning(t *testing.T) {
+	// One free existing node that fits the first pod.
+	existing := makeConcreteNodeInfo("existing", 8, 32, map[string]string{
+		v1.LabelTopologyZone: "us-west-2a",
+	})
+	// A big cheap-per-unit offering; with a high PackingWeight and lots of
+	// remaining batch demand, the credit on a fresh/in-flight node is large and
+	// positive, so its effective cost goes negative.
+	big := makeMultiZoneInstanceType("m5.16xlarge", 64, 256, []string{"us-west-2a"}, "on-demand", 0.10)
+
+	// Many small pods: pod 0 fits the free node; the rest create heavy remaining
+	// demand (fueling the lookahead credit) and force provisioning.
+	pods := []*v1.Pod{makePod("fits-existing", 2, 2048)}
+	for i := 0; i < 20; i++ {
+		pods = append(pods, makePod(fmt.Sprintf("filler-%d", i), 2, 2048))
+	}
+
+	input := Input{
+		Pods:         pods,
+		ClusterState: &ClusterState{Nodes: []fwk.NodeInfo{existing}},
+		Offerings:    []*capacity.InstanceType{big},
+	}
+
+	result, err := Schedule(context.Background(), newMarginalCostFramework(), input, Options{PackingWeight: 1.0})
+	if err != nil {
+		t.Fatalf("Schedule failed: %v", err)
+	}
+	// The free existing node must absorb pods (>=1 binding), never be passed over
+	// in favor of a credit-discounted new node.
+	if len(result.Bindings) == 0 {
+		t.Fatalf("bind-first violated: free existing node was passed over for credited provisioning (0 bindings, %d NodeClaims)",
+			len(result.NodeClaims))
+	}
+	t.Logf("PASS: free bind won over credit-negative provisioning (%d bindings, %d NodeClaims)",
+		len(result.Bindings), len(result.NodeClaims))
 }
 
 // TestSchedule_PackOntoInFlightBeforeNewNode proves the in-flight tier: once a

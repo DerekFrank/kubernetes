@@ -62,15 +62,37 @@ type Result struct {
 	Errors      map[*v1.Pod]error
 }
 
+// Rung is one action-class in the scheduling waterfall (see Options.Waterfall).
+// The follow-up tries rungs in order and takes the first that is feasible for the
+// pod — a fixed, legible order, NOT a cost comparison. We concede preempt and
+// provision cost the same node in the contested case; ordering them is an ordinal
+// preference (which the room can audit) rather than a cardinal $/hr tradeoff (which
+// no user can supply). Bind is not a rung — a feasible bind to retained capacity
+// dominates everything on every axis (free, instant, harmless), so it is always
+// tried first, structurally, before the waterfall runs.
+type Rung int
+
+const (
+	// RungPreempt: evict strictly-lower-priority victims to fit the pod on existing
+	// capacity. Priority-gated; a production version also honors PDB/preemptionPolicy.
+	RungPreempt Rung = iota
+	// RungProvision: launch new capacity (in-flight NodeClaim or a fresh node).
+	RungProvision
+)
+
 // Options configures scheduling behavior.
 type Options struct {
-	// PreemptionPenalty is subtracted from preemption candidate scores.
-	PreemptionPenalty int64
-
-	// CostWeight controls how much cost matters vs. other scoring signals.
-	// Applied as a bonus for existing nodes (zero marginal cost) and
-	// inversely for potential nodes (cheaper = higher score).
-	CostWeight int64
+	// Waterfall is the ordered list of action-classes the follow-up tries for a pod
+	// that cannot bind to retained capacity. The first feasible rung wins; there is
+	// no cost comparison across rungs. Defaults (nil) to today's behavior,
+	// {RungPreempt, RungProvision} — preempt-before-provision — which is
+	// back-compat-safe. Flip to {RungProvision, RungPreempt} for provision-first
+	// (the "provisioning dominates preemption" preference), which is the opt-in the
+	// design argues most workloads should choose. An empty rung list still binds but
+	// never provisions or preempts (pure bind-or-fail). Preemption also only fires
+	// if the pod's priority permits evicting something (already opt-in via
+	// PriorityClass), so a preempt rung is inert for a pod with nothing to preempt.
+	Waterfall []Rung
 
 	// PreferenceDiscount is the multiplicative price discount per unit of
 	// guaranteed soft-preference weight (D5). An option whose offering set

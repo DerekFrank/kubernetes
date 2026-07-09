@@ -110,13 +110,6 @@ func solve(
 			effCost  float64 // effective cost of committing this pod here (lower wins)
 			won      option  // the winning narrowing to apply at commit (potential nodes)
 		}
-		var feasible []candidate
-
-		// Per-pod scoring stack: one expander per soft preference (generates the
-		// honor/don't-honor lattice), then pure scorers over each leaf option.
-		expanders := buildExpanders(pod, opts)
-		scorers := buildScorers(pod, opts)
-
 		// Topology spread as requirements, computed up front (Karpenter-style):
 		// the valid-domain set per spread key, injected into each candidate's
 		// requirements so off-skew domains are priced out of the superposition by
@@ -125,6 +118,7 @@ func solve(
 		topoReqs := topologyDomainReqs(pod, snap, topoUniverse)
 
 		// --- Tier 0: existing real nodes (marginal cost ~0 — already paid) ---
+		var existingFeasible []candidate
 		for _, ni := range snap.Nodes() {
 			status := f.RunFilterPlugins(ctx, state, pod, ni)
 			if !status.IsSuccess() {
@@ -138,31 +132,67 @@ func solve(
 				continue
 			}
 			// Topology spread: a concrete node has a fixed domain, so check it
-			// directly against current counts.
+			// directly against current counts. An existing node that would violate
+			// maxSkew is NOT a feasible bind, so it never short-circuits below —
+			// bind-first still honors spread because infeasible-by-topology nodes
+			// are excluded here.
 			if !nodeSatisfiesTopology(pod, ni.Node(), snap, topoUniverse) {
 				continue
 			}
-			feasible = append(feasible, candidate{
+			existingFeasible = append(existingFeasible, candidate{
 				nodeInfo: ni,
 				tier:     tierExisting,
-				// Already-paid capacity: marginal cost 0. Soft preferences are a
-				// multiplicative discount on cost (D5), and a discount on $0 is $0 —
-				// so a soft preference never makes a free bind more or less
-				// attractive, and never tips provisioning over it. (A pod that
-				// *requires* an attribute the node lacks was already filtered out.)
-				effCost: 0,
+				effCost:  0, // already-paid capacity
 			})
 		}
 
+		// --- D17: bind-first. A feasible bind to retained capacity is ~$0 and, by
+		// D1, always beats provisioning (which is strictly >$0) — so if ANY existing
+		// node is feasible, bind immediately and do NOT build or score the
+		// provisioning tiers. This hoists the cost-model theorem out of the inner
+		// loop: catalog-width scoring cost (O1) is paid only for the unschedulable
+		// remainder, and the bind hot path never touches the superposition
+		// machinery. Soft preferences are a multiplicative discount on cost (D5), and
+		// a discount on $0 is $0, so they can neither improve nor tip a free bind —
+		// there is nothing for provisioning to win here. (Among multiple feasible
+		// binds the choice is a pure-binding decision; the POC takes the first in
+		// snapshot order — all are marginal-cost 0 — where a production path would
+		// score them via the stock framework Score plugins. This is the "keep stock
+		// kube-scheduler wholesale" half of D17.)
+		if len(existingFeasible) > 0 {
+			winner := existingFeasible[0]
+			result.Bindings = append(result.Bindings, Binding{
+				Pod:      pod,
+				NodeName: winner.nodeInfo.Node().Name,
+				Score:    0,
+			})
+			// Record into the view only — never mutate the shared, immutable base
+			// NodeInfo. Resource fit and topology for later pods read from the view.
+			snap.AddPod(pod, winner.nodeInfo.Node().Name, winner.nodeInfo.Node().Labels)
+			continue
+		}
+
+		// --- Unschedulable remainder: provision / preempt follow-up ---
+		// Only reached when no existing node is feasible. The provisioning-only
+		// candidate set and the expand-then-score machinery below are built here,
+		// not per pod, so a bindable pod pays none of it.
+		var feasible []candidate
+
+		// Per-pod scoring stack: one expander per soft preference (generates the
+		// honor/don't-honor lattice), then pure scorers over each leaf option.
+		expanders := buildExpanders(pod, opts)
+		scorers := buildScorers(pod, opts)
+
 		// --- Tier 1: in-flight PotentialNodes (effective = delta of adding the pod) ---
-		// Plugins narrow the superposition as a side effect of Filter.
-		// Snapshot state so we can roll back if Filter ultimately fails.
+		// NarrowForPod applies the pod's hard constraints to the superposition
+		// directly (no framework — a PotentialNode is not a concrete NodeInfo).
+		// Snapshot state so we can roll back if narrowing ultimately fails.
 		for _, pn := range potentialNodes {
 			baseline := totalScore(option{reqs: pn.Requirements, types: pn.InstanceTypes}, scorers)
 			savedTypes := pn.InstanceTypes
 			savedReqs := pn.Requirements
 
-			status := f.RunFilterPlugins(ctx, state, pod, pn)
+			status := pn.NarrowForPod(pod)
 			if status.IsSuccess() {
 				seed, ok := seedWithTopology(pn.Requirements, pn.InstanceTypes, topoReqs)
 				if !ok {
@@ -186,13 +216,12 @@ func solve(
 		}
 
 		// --- Tier 2: the unconstrained dummy (effective = a whole new node) ---
-		// We always offer the option of launching a brand-new node, regardless of
-		// whether existing/in-flight candidates are feasible. The dummy is built
-		// fresh per pod from the full offering set, then narrowed by Filter; its
-		// baseline is 0 because it is not yet part of the plan.
+		// We always offer the option of launching a brand-new node. The dummy is
+		// built fresh per pod from the full offering set, then narrowed by the pod's
+		// hard constraints; its baseline is 0 because it is not yet part of the plan.
 		dummy := createPotentialNode(pod, offerings)
 		if dummy != nil {
-			status := f.RunFilterPlugins(ctx, state, pod, dummy)
+			status := dummy.NarrowForPod(pod)
 			if status.IsSuccess() {
 				seed, ok := seedWithTopology(dummy.Requirements, dummy.InstanceTypes, topoReqs)
 				if ok {
@@ -210,61 +239,95 @@ func solve(
 			}
 		}
 
-		if len(feasible) == 0 {
+		// --- Provisioning rung: pick the cheapest capacity (in-flight vs dummy). ---
+		// This is a WITHIN-rung cardinal argmin — cost is the right currency here
+		// (which node is cheaper is a real $/hr question). It selects the best
+		// provisioning option but does NOT yet commit; the waterfall decides whether
+		// this rung fires at all, relative to preemption.
+		var provisionWinner *candidate
+		if len(feasible) > 0 {
+			bestIdx := 0
+			for i := 1; i < len(feasible); i++ {
+				if betterCandidate(feasible[i].effCost, feasible[i].tier,
+					feasible[bestIdx].effCost, feasible[bestIdx].tier) {
+					bestIdx = i
+				}
+			}
+			provisionWinner = &feasible[bestIdx]
+		}
+
+		// --- Preemption rung: find a feasible eviction (least disruptive). ---
+		// No cost — the waterfall orders preempt vs provision, it does not price them.
+		preemptOpt, preemptOK := findPreemptionOption(snap, pod)
+
+		// --- Waterfall: try rungs in configured order; first feasible one fires. ---
+		// bind-first already handled retained capacity above; this orders the two
+		// follow-up actions (preempt / provision) by fixed preference, not cost. Only
+		// rungs present in the waterfall can fire — a preempt-only list never
+		// provisions, and vice versa.
+		committed := false
+		doProvision := false
+		for _, rung := range waterfallOrder(opts) {
+			if rung == RungPreempt && preemptOK {
+				result.Preemptions = append(result.Preemptions, Preemption{
+					Pod:      pod,
+					NodeName: preemptOpt.nodeName,
+					Victims:  preemptOpt.victims,
+				})
+				// Victims become displaced demand the CALLER re-batches (they re-enter
+				// scheduling like any deleted pod); solve() does not recursively commit
+				// them. Mirrors kube-scheduler: preemption evicts + the preemptor binds
+				// on a later pass.
+				for _, vp := range preemptOpt.victims {
+					snap.evictFromNode(vp, preemptOpt.nodeName)
+				}
+				snap.AddPod(pod, preemptOpt.nodeName, nil)
+				committed = true
+				break
+			}
+			if rung == RungProvision && provisionWinner != nil {
+				doProvision = true
+				break
+			}
+		}
+		if committed {
+			continue
+		}
+		if !doProvision {
 			result.Errors[pod] = fmt.Errorf("no feasible node or instance type for pod %s/%s", pod.Namespace, pod.Name)
 			continue
 		}
+		winner := *provisionWinner
 
-		// --- Select: lowest effective cost wins; ties broken by tier ---
-		bestIdx := 0
-		for i := 1; i < len(feasible); i++ {
-			if betterCandidate(feasible[i].effCost, feasible[i].tier,
-				feasible[bestIdx].effCost, feasible[bestIdx].tier) {
-				bestIdx = i
-			}
+		// --- Commit provisioning --- (a PotentialNode: in-flight or dummy).
+
+		// Re-apply the narrowing we rolled back during probing (the dummy was never
+		// rolled back, but re-narrowing is idempotent — narrowing is monotonic).
+		_ = winner.pNode.NarrowForPod(pod)
+		// Apply the winning option: pin the superposition to the preference
+		// constraints that won, so the emitted NodeClaim honors what we scored.
+		winner.pNode.Requirements = winner.won.reqs
+		winner.pNode.InstanceTypes = winner.won.types
+
+		// Topology spread: collapse to a single domain per spread key and
+		// record it — the "count only on collapse" step. The valid-domain
+		// requirement was already injected during scoring (topoReqs), so this
+		// only resolves which specific domain among the valid ones.
+		domains := pnDomains[winner.pNode.Hostname()]
+		if domains == nil {
+			domains = map[string]string{}
 		}
-		winner := feasible[bestIdx]
+		recordTopology(pod, winner.pNode, snap, domains)
+		pnDomains[winner.pNode.Hostname()] = domains
 
-		// --- Commit ---
-		if winner.pNode != nil {
-			// Re-run Filter on the winner to re-apply the narrowing we rolled back
-			// during probing (the dummy was never rolled back, but re-running is
-			// idempotent — narrowing is monotonic).
-			_ = f.RunFilterPlugins(ctx, state, pod, winner.pNode)
-			// Apply the winning option: pin the superposition to the preference
-			// constraints that won, so the emitted NodeClaim honors what we scored.
-			winner.pNode.Requirements = winner.won.reqs
-			winner.pNode.InstanceTypes = winner.won.types
-
-			// Topology spread: collapse to a single domain per spread key and
-			// record it — the "count only on collapse" step. The valid-domain
-			// requirement was already injected during scoring (topoReqs), so this
-			// only resolves which specific domain among the valid ones.
-			domains := pnDomains[winner.pNode.Hostname()]
-			if domains == nil {
-				domains = map[string]string{}
-			}
-			recordTopology(pod, winner.pNode, snap, domains)
-			pnDomains[winner.pNode.Hostname()] = domains
-
-			pi, _ := framework.NewPodInfo(pod)
-			winner.pNode.AddPodInfo(pi)
-			snap.AddPod(pod, winner.pNode.Hostname(), domains)
-			if winner.isDummy {
-				// The dummy collapsed into a committed in-flight node. Promote it
-				// so subsequent pods can pack onto it, and mint a fresh dummy next
-				// iteration (created at the top of the loop).
-				potentialNodes = append(potentialNodes, winner.pNode)
-			}
-		} else {
-			result.Bindings = append(result.Bindings, Binding{
-				Pod:      pod,
-				NodeName: winner.nodeInfo.Node().Name,
-				Score:    -int64(winner.effCost),
-			})
-			// Record into the view only — never mutate the shared, immutable base
-			// NodeInfo. Resource fit and topology for later pods read from the view.
-			snap.AddPod(pod, winner.nodeInfo.Node().Name, winner.nodeInfo.Node().Labels)
+		pi, _ := framework.NewPodInfo(pod)
+		winner.pNode.AddPodInfo(pi)
+		snap.AddPod(pod, winner.pNode.Hostname(), domains)
+		if winner.isDummy {
+			// The dummy collapsed into a committed in-flight node. Promote it
+			// so subsequent pods can pack onto it, and mint a fresh dummy next
+			// iteration (created at the top of the loop).
+			potentialNodes = append(potentialNodes, winner.pNode)
 		}
 	}
 
@@ -487,6 +550,17 @@ func lookaheadCredit(opt option, usedCPU, remainingCPU, weight float64) float64 
 		return 0
 	}
 	return packingCredit(chosen, price, usedCPU, remainingCPU, weight)
+}
+
+// waterfallOrder returns the follow-up rung order for a solve. Defaults to
+// today's behavior — preempt before provision — when unset, which is
+// back-compat-safe; callers flip to {RungProvision, RungPreempt} to opt into
+// provisioning-first. Bind is not a rung (it is always tried first, structurally).
+func waterfallOrder(opts Options) []Rung {
+	if len(opts.Waterfall) == 0 {
+		return []Rung{RungPreempt, RungProvision}
+	}
+	return opts.Waterfall
 }
 
 // betterCandidate reports whether candidate (m1, t1) should beat the current best

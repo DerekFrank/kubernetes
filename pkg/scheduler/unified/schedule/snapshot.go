@@ -94,6 +94,10 @@ type view struct {
 	// addedRequested is the per-node total of tentative placements, maintained
 	// incrementally in AddPod so resource-fit checks stay O(1).
 	addedRequested map[string]resourceTotal
+	// removedRequested is the per-node total of evicted (preempted) pods,
+	// maintained in RemovePodFromNode so resource-fit sees the freed capacity.
+	// Only preemption removes pods mid-solve; the bind hot path only adds.
+	removedRequested map[string]resourceTotal
 }
 
 func newView(base *Snapshot) *view {
@@ -235,7 +239,24 @@ func (v *view) domainCounts(topologyKey string, selector *metav1.LabelSelector) 
 func (v *view) requestedOn(nodeName string) (cpuMillis, memBytes int64) {
 	bt := v.base.requested[nodeName]
 	at := v.addedRequested[nodeName]
-	return bt.cpuMillis + at.cpuMillis, bt.memBytes + at.memBytes
+	rt := v.removedRequested[nodeName]
+	return bt.cpuMillis + at.cpuMillis - rt.cpuMillis, bt.memBytes + at.memBytes - rt.memBytes
+}
+
+// evictFromNode masks a pod out of the view AND credits its requests back to the
+// node's free capacity, so a subsequent resource-fit check sees the freed room.
+// This is the preemption path (the only place pods are removed mid-solve). The
+// per-node freed total is maintained incrementally to keep requestedOn O(1).
+func (v *view) evictFromNode(pod *v1.Pod, nodeName string) {
+	v.RemovePod(pod.Namespace, pod.Name)
+	if v.removedRequested == nil {
+		v.removedRequested = map[string]resourceTotal{}
+	}
+	t := v.removedRequested[nodeName]
+	pt := podRequestTotal(pod)
+	t.cpuMillis += pt.cpuMillis
+	t.memBytes += pt.memBytes
+	v.removedRequested[nodeName] = t
 }
 
 func cloneSet(s map[string]struct{}) map[string]struct{} {

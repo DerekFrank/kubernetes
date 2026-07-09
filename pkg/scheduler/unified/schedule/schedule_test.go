@@ -16,13 +16,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
 )
 
-// filterPlugin is the minimal Filter interface our unified plugins satisfy.
-// The framework stub (newMarginalCostFramework, schedule_marginalcost_test.go)
-// runs a slice of these against each candidate.
-type filterPlugin interface {
-	Filter(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status
-}
-
 // --- Pod / offering / node builders ---
 
 func makePod(name string, cpu, memMi int64) *v1.Pod {

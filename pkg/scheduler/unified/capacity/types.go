@@ -60,6 +60,30 @@ type Offering struct {
 	Requirements Requirements
 	Price        float64
 	Available    bool
+
+	// PerformanceValue is the intrinsic worth of this offering's hardware relative
+	// to its price — e.g. "this generation is 20% better" is PerformanceValue 0.20.
+	// It is OFFERING data, not a workload preference: the value of a chip generation
+	// is a property of the capacity, not of the pod that lands on it. It discounts
+	// the price the solver compares (see EffectivePrice), so a better-but-equally-
+	// priced offering wins on the cost axis without any separate scoring term or
+	// workload-authored exchange rate. Zero means "no adjustment" (price as-is).
+	PerformanceValue float64
+}
+
+// EffectivePrice is the price the solver and Select compare on: the sticker Price
+// discounted by PerformanceValue (capped so it never goes negative). This is the
+// single place performance-value enters the cost axis — there is no separate Cost
+// plugin; cost is offering data.
+func (o *Offering) EffectivePrice() float64 {
+	v := o.PerformanceValue
+	if v < 0 {
+		v = 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	return o.Price * (1 - v)
 }
 
 // Requirements maps label keys to allowed values. This is a simplified version of
