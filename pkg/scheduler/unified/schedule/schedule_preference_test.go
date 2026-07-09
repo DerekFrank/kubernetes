@@ -106,7 +106,7 @@ func TestSchedule_PreferenceRanksOfferingsWhenProvisioning(t *testing.T) {
 				if archReq == nil {
 					return nil
 				}
-				return archReq.Values.UnsortedList()
+				return archReq.Values().UnsortedList()
 			}())
 	}
 	t.Logf("PASS: with provisioning forced, the arm preference discounted arm below x86 → arm-pinned NodeClaim")
@@ -137,7 +137,7 @@ func TestSchedule_PreferenceDiscountTooSmallToReRank(t *testing.T) {
 	archReq := result.NodeClaims[0].Requirements.Get(archKey)
 	if archReq != nil && archReq.Has("arm64") && !archReq.Has("amd64") {
 		t.Fatalf("discount too small to overcome arm's price gap; expected x86 to win, got arm-pinned %v",
-			archReq.Values.UnsortedList())
+			archReq.Values().UnsortedList())
 	}
 	t.Logf("PASS: arm discount (10%%) didn't cover the price gap; cheaper x86 offering won, one pass")
 }

@@ -112,14 +112,14 @@ func TestSchedule_FlexibilityPenalizesOverConstraint(t *testing.T) {
 	}
 	zoneReq := result.NodeClaims[0].Requirements.Get(v1.LabelTopologyZone)
 	if zoneReq != nil && zoneReq.Len() == 1 {
-		t.Fatalf("flexibility should have prevented pinning to a single zone, but zone=%v", zoneReq.Values.UnsortedList())
+		t.Fatalf("flexibility should have prevented pinning to a single zone, but zone=%v", zoneReq.Values().UnsortedList())
 	}
 	t.Logf("PASS: kept multi-zone flexibility (zones=%v) instead of honoring a cheap preference that collapsed pools",
 		func() any {
 			if zoneReq == nil {
 				return "unconstrained"
 			}
-			return zoneReq.Values.UnsortedList()
+			return zoneReq.Values().UnsortedList()
 		}())
 }
 

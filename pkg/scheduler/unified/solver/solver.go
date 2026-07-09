@@ -188,25 +188,13 @@ func tryAdd(claim *virtualnode.PotentialNode, pod *v1.Pod, narrowers []virtualno
 	return true
 }
 
-// --- pod helpers (local; the solver package is standalone) ---
+// --- pod helpers ---
 
+// podRequirements extracts a pod's hard label constraints. Delegates to
+// virtualnode.PodHardRequirements so there is a single extraction implementation
+// (honors all operators via the ported capacity.Requirement).
 func podRequirements(pod *v1.Pod) capacity.Requirements {
-	reqs := capacity.NewRequirements()
-	for key, value := range pod.Spec.NodeSelector {
-		reqs[key] = capacity.NewRequirement(key, v1.NodeSelectorOpIn, value)
-	}
-	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
-		if req := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; req != nil {
-			for _, term := range req.NodeSelectorTerms {
-				for _, expr := range term.MatchExpressions {
-					if expr.Operator == v1.NodeSelectorOpIn {
-						reqs[expr.Key] = capacity.NewRequirement(expr.Key, expr.Operator, expr.Values...)
-					}
-				}
-			}
-		}
-	}
-	return reqs
+	return virtualnode.PodHardRequirements(pod)
 }
 
 func podRequests(pod *v1.Pod) v1.ResourceList {
@@ -236,7 +224,7 @@ func unionRequirements(types []*capacity.InstanceType) capacity.Requirements {
 	for _, it := range types {
 		for key, req := range it.Requirements {
 			if existing, ok := union[key]; ok {
-				union[key] = &capacity.Requirement{Key: key, Operator: req.Operator, Values: existing.Values.Union(req.Values)}
+				union[key] = existing.Union(req)
 			} else {
 				union[key] = req.Copy()
 			}

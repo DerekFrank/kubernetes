@@ -203,11 +203,11 @@ func effectiveValues(a, b *capacity.Requirement) sets.Set[string] {
 	case a == nil && b == nil:
 		return nil
 	case a == nil:
-		return b.Values
+		return b.Values()
 	case b == nil:
-		return a.Values
+		return a.Values()
 	default:
-		return a.Values.Intersection(b.Values)
+		return a.Values().Intersection(b.Values())
 	}
 }
 
@@ -264,7 +264,7 @@ func optionKey(o option) string {
 		if key == v1.LabelHostname {
 			continue
 		}
-		vals := req.Values.UnsortedList()
+		vals := req.Values().UnsortedList()
 		sort.Strings(vals)
 		reqParts = append(reqParts, key+"="+strings.Join(vals, "|"))
 	}

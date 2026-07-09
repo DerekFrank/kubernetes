@@ -325,24 +325,51 @@ func toleratesTaints(tolerations []v1.Toleration, taints []v1.Taint) *fwk.Status
 
 // podHardRequirements extracts a pod's hard label constraints (nodeSelector plus
 // requiredDuringScheduling node-affinity In-terms) as capacity.Requirements. Only
-// In is handled (the POC scope); other operators are ignored for narrowing.
+// requiredDuringScheduling node-affinity In-terms. All operators (In / NotIn /
+// Exists / DoesNotExist / Gt / Lt) are honored now that capacity.Requirement
+// represents them — a pod's `arch NotIn [arm64]` narrows the superposition instead
+// of being silently dropped. Multiple terms on the same key intersect.
+// PodHardRequirements is the exported entry point for extracting a pod's hard label
+// constraints as capacity.Requirements (see podHardRequirements). Callers outside
+// this package (the solver) use it so there is one extraction implementation.
+func PodHardRequirements(pod *v1.Pod) capacity.Requirements {
+	return podHardRequirements(pod)
+}
+
 func podHardRequirements(pod *v1.Pod) capacity.Requirements {
 	reqs := capacity.NewRequirements()
 	for key, value := range pod.Spec.NodeSelector {
-		reqs[key] = capacity.NewRequirement(key, v1.NodeSelectorOpIn, value)
+		addRequirement(reqs, capacity.NewRequirement(key, v1.NodeSelectorOpIn, value))
 	}
 	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
 		if required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; required != nil {
-			for _, term := range required.NodeSelectorTerms {
+			// Only the first NodeSelectorTerm is modeled (terms are OR-ed; a single
+			// intersecting term is the common case and matches the POC scope).
+			for _, term := range firstTerm(required.NodeSelectorTerms) {
 				for _, expr := range term.MatchExpressions {
-					if expr.Operator == v1.NodeSelectorOpIn {
-						reqs[expr.Key] = capacity.NewRequirement(expr.Key, expr.Operator, expr.Values...)
-					}
+					addRequirement(reqs, capacity.NewRequirement(expr.Key, expr.Operator, expr.Values...))
 				}
 			}
 		}
 	}
 	return reqs
+}
+
+// addRequirement intersects req into reqs under its key (multiple terms on one key
+// compose by intersection, matching Karpenter's Requirements.Add).
+func addRequirement(reqs capacity.Requirements, req *capacity.Requirement) {
+	if existing, ok := reqs[req.Key]; ok {
+		reqs[req.Key] = existing.Intersect(req)
+	} else {
+		reqs[req.Key] = req
+	}
+}
+
+func firstTerm(terms []v1.NodeSelectorTerm) []v1.NodeSelectorTerm {
+	if len(terms) == 0 {
+		return nil
+	}
+	return terms[:1]
 }
 
 // podResourceRequests sums a pod's container resource requests.

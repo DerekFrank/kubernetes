@@ -504,12 +504,12 @@ func seedWithTopology(reqs capacity.Requirements, types []*capacity.InstanceType
 // to for a topology key, from its surviving instance types' requirements.
 func possibleDomains(pn *virtualnode.PotentialNode, key string) []string {
 	if req := pn.Requirements.Get(key); req != nil {
-		return req.Values.UnsortedList()
+		return req.Values().UnsortedList()
 	}
 	seen := map[string]struct{}{}
 	for _, it := range pn.InstanceTypes {
 		if req := it.Requirements.Get(key); req != nil {
-			for _, v := range req.Values.UnsortedList() {
+			for _, v := range req.Values().UnsortedList() {
 				seen[v] = struct{}{}
 			}
 		}
@@ -609,13 +609,7 @@ func unionRequirements(types []*capacity.InstanceType) capacity.Requirements {
 	for _, it := range types {
 		for key, req := range it.Requirements {
 			if existing, ok := union[key]; ok {
-				// Union: merge value sets
-				merged := existing.Values.Union(req.Values)
-				union[key] = &capacity.Requirement{
-					Key:      key,
-					Operator: req.Operator,
-					Values:   merged,
-				}
+				union[key] = existing.Union(req)
 			} else {
 				union[key] = req.Copy()
 			}
@@ -638,22 +632,9 @@ func podResourceScore(pod *v1.Pod) int64 {
 }
 
 func podSchedulingRequirements(pod *v1.Pod) capacity.Requirements {
-	reqs := capacity.NewRequirements()
-	for key, value := range pod.Spec.NodeSelector {
-		reqs[key] = capacity.NewRequirement(key, v1.NodeSelectorOpIn, value)
-	}
-	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
-		if required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; required != nil {
-			for _, term := range required.NodeSelectorTerms {
-				for _, expr := range term.MatchExpressions {
-					if expr.Operator == v1.NodeSelectorOpIn {
-						reqs[expr.Key] = capacity.NewRequirement(expr.Key, expr.Operator, expr.Values...)
-					}
-				}
-			}
-		}
-	}
-	return reqs
+	// Single extraction implementation (honors all operators via the ported
+	// capacity.Requirement), shared with the solver package.
+	return virtualnode.PodHardRequirements(pod)
 }
 
 func podTotalRequests(pod *v1.Pod) v1.ResourceList {

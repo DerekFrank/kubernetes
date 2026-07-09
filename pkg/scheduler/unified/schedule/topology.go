@@ -93,7 +93,7 @@ func topologyUniverse(pod *v1.Pod, offerings []*capacity.InstanceType, snap *vie
 	for _, it := range offerings {
 		for key := range keys {
 			if req := it.Requirements.Get(key); req != nil {
-				for _, v := range req.Values.UnsortedList() {
+				for _, v := range req.Values().UnsortedList() {
 					add(key, v)
 				}
 			}

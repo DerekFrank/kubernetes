@@ -101,7 +101,7 @@ func TestSchedule_TopologyRespectsExistingPods(t *testing.T) {
 	for _, nc := range result.NodeClaims {
 		zr := nc.Requirements.Get(v1.LabelTopologyZone)
 		if zr != nil && zr.Has("us-west-2a") {
-			t.Fatalf("new pod placed in zone-a despite it already being heaviest: %v", zr.Values.UnsortedList())
+			t.Fatalf("new pod placed in zone-a despite it already being heaviest: %v", zr.Values().UnsortedList())
 		}
 	}
 	if len(result.Errors) != 0 {

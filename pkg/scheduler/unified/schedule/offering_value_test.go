@@ -65,7 +65,7 @@ func TestSchedule_PerformanceValueLowersEffectivePrice(t *testing.T) {
 				if itReq == nil {
 					return nil
 				}
-				return itReq.Values.UnsortedList()
+				return itReq.Values().UnsortedList()
 			}())
 	}
 	// But the cheapest effective price reflects the higher-value offering's discount.

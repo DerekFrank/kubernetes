@@ -5,6 +5,9 @@
 package capacity
 
 import (
+	"math"
+	"strconv"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -110,17 +113,31 @@ func (r Requirements) Add(others ...Requirements) {
 	}
 }
 
-// Compatible checks whether these requirements are compatible with another set.
-// Two sets are compatible if, for every shared key, their values intersect.
+// Compatible checks whether these requirements are compatible with another set:
+// for every shared key, the two requirements must have a non-empty intersection —
+// EXCEPT that two "exclusion" requirements (NotIn/DoesNotExist on both sides) are
+// always compatible, since a value excluded by both can still exist (Karpenter's
+// Intersects asymmetry). Without this, e.g. `arch NotIn [arm64]` vs
+// `arch NotIn [ppc64]` would be wrongly rejected.
 func (r Requirements) Compatible(other Requirements) bool {
 	for key, req := range r {
-		if otherReq, ok := other[key]; ok {
-			if req.Intersect(otherReq).Len() == 0 {
-				return false
-			}
+		otherReq, ok := other[key]
+		if !ok {
+			continue
 		}
+		if req.HasIntersection(otherReq) {
+			continue
+		}
+		if isExclusion(req.Operator()) && isExclusion(otherReq.Operator()) {
+			continue
+		}
+		return false
 	}
 	return true
+}
+
+func isExclusion(op v1.NodeSelectorOperator) bool {
+	return op == v1.NodeSelectorOpNotIn || op == v1.NodeSelectorOpDoesNotExist
 }
 
 // Get returns the requirement for a key, or nil if not present.
@@ -128,49 +145,181 @@ func (r Requirements) Get(key string) *Requirement {
 	return r[key]
 }
 
-// Requirement represents the allowed values for a single label key.
+// Requirement is an efficient representation of a v1.NodeSelectorRequirement,
+// ported from Karpenter's scheduling.Requirement (karpenter/pkg/scheduling/
+// requirement.go). It represents ALL node-selector operators, not just In:
+//
+//   - In:            complement=false, values={a,b}   → "one of {a,b}"
+//   - NotIn:         complement=true,  values={a,b}   → "anything except {a,b}"
+//   - Exists:        complement=true,  values={}      → "any value (key present)"
+//   - DoesNotExist:  complement=false, values={}      → "no value (key absent)"
+//   - Gt/Lt:         complement=true with gte/lte bounds (canonicalized to Gte/Lte)
+//
+// The `complement` flag is what lets NotIn/Exists represent an *infinite* permitted
+// set (everything except the finite excluded `values`), so intersection over any
+// mix of operators is well-defined. An In-only representation cannot express NotIn
+// and silently drops it — which produced infeasible NodeClaims that then won the
+// cost argmin. This port fixes that.
 type Requirement struct {
-	Key      string
-	Operator v1.NodeSelectorOperator
-	Values   sets.Set[string]
+	Key        string
+	complement bool
+	values     sets.Set[string]
+	gte        *int // inclusive lower bound (Gt canonicalized to Gte)
+	lte        *int // inclusive upper bound (Lt canonicalized to Lte)
 }
 
-// NewRequirement creates a requirement with the given key, operator, and values.
-func NewRequirement(key string, op v1.NodeSelectorOperator, values ...string) *Requirement {
-	return &Requirement{
-		Key:      key,
-		Operator: op,
-		Values:   sets.New[string](values...),
+// NewRequirement creates a requirement for the given key, operator, and values.
+// Gt/Lt are canonicalized to inclusive Gte/Lte bounds.
+func NewRequirement(key string, operator v1.NodeSelectorOperator, values ...string) *Requirement {
+	// Common case: In — inline it.
+	if operator == v1.NodeSelectorOpIn {
+		return &Requirement{Key: key, values: sets.New[string](values...), complement: false}
 	}
+	r := &Requirement{Key: key, values: sets.New[string](), complement: true}
+	if operator == v1.NodeSelectorOpDoesNotExist {
+		r.complement = false
+	}
+	if operator == v1.NodeSelectorOpNotIn {
+		r.values.Insert(values...)
+	}
+	switch operator {
+	case v1.NodeSelectorOpGt:
+		v, _ := strconv.Atoi(values[0])
+		v++ // canonicalize Gt N to inclusive lower bound N+1
+		r.gte = &v
+	case v1.NodeSelectorOpLt:
+		v, _ := strconv.Atoi(values[0])
+		v-- // canonicalize Lt N to inclusive upper bound N-1
+		r.lte = &v
+	}
+	return r
 }
 
-// Intersect returns a new Requirement representing the intersection of values.
+// Intersect returns a new Requirement constrained by both req and other. Handles
+// all four complement×complement combinations plus numeric bounds. A nil operand
+// is treated as "unconstrained" (returns a copy of the other).
 func (req *Requirement) Intersect(other *Requirement) *Requirement {
-	if req == nil || other == nil {
-		if req != nil {
-			return req.Copy()
-		}
-		if other != nil {
-			return other.Copy()
-		}
-		return nil
+	if req == nil {
+		return other.Copy()
+	}
+	if other == nil {
+		return req.Copy()
 	}
 
-	// Both are In operators — intersect value sets
-	intersection := req.Values.Intersection(other.Values)
-	return &Requirement{
-		Key:      req.Key,
-		Operator: v1.NodeSelectorOpIn,
-		Values:   intersection,
+	complement := req.complement && other.complement
+	gte := maxIntPtr(req.gte, other.gte)
+	lte := minIntPtr(req.lte, other.lte)
+	if gte != nil && lte != nil && *gte > *lte {
+		return NewRequirement(req.Key, v1.NodeSelectorOpDoesNotExist)
+	}
+
+	var values sets.Set[string]
+	switch {
+	case req.complement && other.complement:
+		values = req.values.Union(other.values)
+	case req.complement && !other.complement:
+		values = other.values.Difference(req.values)
+	case !req.complement && other.complement:
+		values = req.values.Difference(other.values)
+	default:
+		values = req.values.Intersection(other.values)
+	}
+	for v := range values {
+		if !withinBounds(v, gte, lte) {
+			values.Delete(v)
+		}
+	}
+	if !complement {
+		gte, lte = nil, nil // bounds only meaningful for the infinite (complement) set
+	}
+	return &Requirement{Key: req.Key, values: values, complement: complement, gte: gte, lte: lte}
+}
+
+// Union returns a new Requirement permitting any value either req or other permits.
+// Used to widen a claim's domain across sibling instance types (the union of what
+// each type could satisfy). Handles complement sets: the union of two "everything
+// except X" / "everything except Y" sets is "everything except (X ∩ Y)".
+func (req *Requirement) Union(other *Requirement) *Requirement {
+	if req == nil {
+		return other.Copy()
+	}
+	if other == nil {
+		return req.Copy()
+	}
+	switch {
+	case req.complement && other.complement:
+		// (¬A) ∪ (¬B) = ¬(A ∩ B): excluded only what BOTH exclude.
+		return &Requirement{Key: req.Key, complement: true, values: req.values.Intersection(other.values)}
+	case req.complement && !other.complement:
+		// (¬A) ∪ B = ¬(A \ B): still infinite, exclude what A excludes but B doesn't add back.
+		return &Requirement{Key: req.Key, complement: true, values: req.values.Difference(other.values)}
+	case !req.complement && other.complement:
+		return &Requirement{Key: req.Key, complement: true, values: other.values.Difference(req.values)}
+	default:
+		return &Requirement{Key: req.Key, complement: false, values: req.values.Union(other.values)}
 	}
 }
 
-// Len returns the number of allowed values.
+// HasIntersection reports whether req and other share any permitted value, without
+// materializing the intersection set.
+func (req *Requirement) HasIntersection(other *Requirement) bool {
+	gte := maxIntPtr(req.gte, other.gte)
+	lte := minIntPtr(req.lte, other.lte)
+	if gte != nil && lte != nil && *gte > *lte {
+		return false
+	}
+	switch {
+	case req.complement && other.complement:
+		return true // two infinite sets always overlap
+	case req.complement && !other.complement:
+		for v := range other.values {
+			if !req.values.Has(v) && withinBounds(v, gte, lte) {
+				return true
+			}
+		}
+		return false
+	case !req.complement && other.complement:
+		for v := range req.values {
+			if !other.values.Has(v) && withinBounds(v, gte, lte) {
+				return true
+			}
+		}
+		return false
+	default:
+		for v := range req.values {
+			if other.values.Has(v) && withinBounds(v, gte, lte) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// Operator reconstructs the node-selector operator this requirement represents.
+func (req *Requirement) Operator() v1.NodeSelectorOperator {
+	if req.complement {
+		if req.values.Len() > 0 {
+			return v1.NodeSelectorOpNotIn
+		}
+		return v1.NodeSelectorOpExists
+	}
+	if req.values.Len() > 0 {
+		return v1.NodeSelectorOpIn
+	}
+	return v1.NodeSelectorOpDoesNotExist
+}
+
+// Len returns the number of permitted values. For complement (infinite) sets this
+// is effectively unbounded; we report a large sentinel so "narrowed to a single
+// value" checks (Len()==1) behave correctly for In requirements.
 func (req *Requirement) Len() int {
 	if req == nil {
 		return 0
 	}
-	return req.Values.Len()
+	if req.complement {
+		return math.MaxInt32 - req.values.Len()
+	}
+	return req.values.Len()
 }
 
 // Copy returns a deep copy of the requirement.
@@ -178,28 +327,96 @@ func (req *Requirement) Copy() *Requirement {
 	if req == nil {
 		return nil
 	}
+	var gte, lte *int
+	if req.gte != nil {
+		v := *req.gte
+		gte = &v
+	}
+	if req.lte != nil {
+		v := *req.lte
+		lte = &v
+	}
 	return &Requirement{
-		Key:      req.Key,
-		Operator: req.Operator,
-		Values:   sets.New[string](req.Values.UnsortedList()...),
+		Key:        req.Key,
+		complement: req.complement,
+		values:     sets.New[string](req.values.UnsortedList()...),
+		gte:        gte,
+		lte:        lte,
 	}
 }
 
-// Has returns whether the requirement contains the given value.
+// Has reports whether the requirement permits the given value.
 func (req *Requirement) Has(value string) bool {
 	if req == nil {
 		return false
 	}
-	return req.Values.Has(value)
+	if req.complement {
+		return !req.values.Has(value) && withinBounds(value, req.gte, req.lte)
+	}
+	return req.values.Has(value) && withinBounds(value, req.gte, req.lte)
 }
 
-// Any returns an arbitrary value from the requirement.
+// Values returns the concrete permitted value set for an In requirement (the common
+// case used for enumerating domains/labels). For a complement requirement the
+// permitted set is infinite, so this returns the *excluded* set; callers that
+// enumerate domains operate on In requirements, where this is the permitted set.
+func (req *Requirement) Values() sets.Set[string] {
+	if req == nil {
+		return nil
+	}
+	return req.values
+}
+
+// Any returns an arbitrary permitted value, or "" if none/infinite-without-members.
 func (req *Requirement) Any() string {
-	if req == nil || req.Values.Len() == 0 {
+	if req == nil || req.complement {
 		return ""
 	}
-	for v := range req.Values {
+	for v := range req.values {
 		return v
 	}
 	return ""
+}
+
+func withinBounds(valueAsString string, gte, lte *int) bool {
+	if gte == nil && lte == nil {
+		return true
+	}
+	val, err := strconv.Atoi(valueAsString)
+	if err != nil {
+		return false // non-integer value can't satisfy a numeric bound
+	}
+	if gte != nil && val < *gte {
+		return false
+	}
+	if lte != nil && val > *lte {
+		return false
+	}
+	return true
+}
+
+func minIntPtr(a, b *int) *int {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case *a < *b:
+		return a
+	default:
+		return b
+	}
+}
+
+func maxIntPtr(a, b *int) *int {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case *a > *b:
+		return a
+	default:
+		return b
+	}
 }
