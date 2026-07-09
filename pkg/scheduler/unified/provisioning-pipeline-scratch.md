@@ -190,6 +190,10 @@ type Problem struct {
 
 ### Soft preferences ARE soft Narrowers — there is no Score surface
 
+> **Status: designed, not yet implemented.** `Narrower.Hard()` exists and
+> `NarrowForPod` skips soft Narrowers, but no soft Narrower is registered and no
+> solver yet exercises the "apply-if-cheap" decision. The model below is the target.
+
 A soft preference is only mechanically real when it **changes the claim** — i.e. when it narrows (pins `arch=arm`). A soft pref that doesn't narrow is a no-op. So there is no separate "score" a soft pref contributes; it is a **Narrower the solver may or may not apply**:
 
 - **Hard Narrower** — solver *must* apply (required affinity, taint, resource fit). Non-negotiable pruning.
@@ -211,6 +215,12 @@ Consequences:
 The one non-plugin shared function: `NewNodeClaim(sources)` builds the *widest* valid claim (all admissible offerings across the ranked sources, overhead-correct allocatable). It owns the **fixed per-node overhead model** (`capacity.MemoryOverheadBytes`) — the single seam where the crude 1Gi model graduates to the real one, improving every solver at once. A solver that hand-rolled construction and dropped the overhead would emit *infeasible* (overcommitted) claims, so this is **correctness**, not just consistency. "Open a claim" and "add a pod" are separate ops: the constructor is the pure ⊤, and seeding a pod is a distinct operation.
 
 ## Fallback ordering: a NodeClaim is a superposition of superpositions
+
+> **Status: designed, not yet implemented.** This section is the target model. The
+> code today has no ranked-source concept — `solver.Problem` carries a flat
+> `Offerings []*capacity.InstanceType` and `NewNodeClaim` takes a flat offering
+> slice. `CapacitySource`, source rank, and the outer-axis collapse below are the
+> next implementation step, not current behavior.
 
 **Requirement, not an option.** Weighted/ranked fallback ("prefer capacity source A; use B only where A can't satisfy") is a hard requirement — real autoscaler implementations depend on it, and the design must support it. Karpenter carries the ordering as **NodePool** weight; other systems carry it differently.
 
@@ -262,4 +272,4 @@ What gets written into kube-scheduler is **(1) the wiring and (2) a default solv
 - **The fan-out *shape* is committed; one solver ships.** The contract is always "Solve produces a set → Select reduces it"; one solver is registered, so the set is a singleton and Select is identity — a plain call, no goroutines. Registering a 2nd solver later turns on fan-out with **zero contract change**. Fan-out is unretrofittable cheaply (a plugin can't grant itself a portfolio — only the orchestrator can invoke N solvers), so the *shape* is in from day one; the *parallelism* and *portfolio* are additive behind it.
 - **Concurrency is the orchestrator's, exclusively.** Plugins stay pure and synchronous `Refine`; the orchestrator decides whether to run them on goroutines. A plugin that spawns its own goroutines breaks the raceless-`Problem` invariant that makes fan-out safe.
 - **One topology is pinned; there is no DAG engine.** `(Problem, Solution[]) → Solution[]` *permits* arbitrary dataflow; the wiring fixes exactly one shape — parallel fan-out → (optional ordered PostSolve) → Select — not a general plugin-graph interpreter.
-- **The default solver is the inline `solve()`:** greedy largest-first + packing lookahead + `NarrowForPod` + topology injection (33 tests green), repackaged behind `Refine(Problem, ∅)`. The default is repackaging, not new work.
+- **The default solver is `solver.Greedy`:** largest-first + first-fit onto open claims + `NarrowForPod` (TaintToleration/NodeAffinity/NodeResourcesFit Narrowers), in the `solver` package, behind the `Solver` interface. Packing lookahead and topology injection exist in the *separate* inline `schedule.solve()` path (D9/D12) and are **not yet ported** into `solver.Greedy` — porting them is follow-up work, not current behavior.
