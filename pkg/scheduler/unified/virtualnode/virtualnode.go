@@ -42,6 +42,7 @@ type PotentialNode struct {
 	Taints []v1.Taint
 
 	pods           []fwk.PodInfo
+	requested      v1.ResourceList // running sum of placed pods' requests (maintained in AddPodInfo)
 	hostname       string
 	generation     int64
 	representative *v1.Node // lazily computed
@@ -115,11 +116,16 @@ func (pn *PotentialNode) Clone() *PotentialNode {
 	}
 	types := append([]*capacity.InstanceType(nil), pn.InstanceTypes...)
 	pods := append([]fwk.PodInfo(nil), pn.pods...)
+	requested := v1.ResourceList{}
+	for name, qty := range pn.requested {
+		requested[name] = qty.DeepCopy()
+	}
 	return &PotentialNode{
 		Requirements:  reqs,
 		InstanceTypes: types,
 		Taints:        pn.Taints,
 		pods:          pods,
+		requested:     requested,
 		hostname:      pn.hostname,
 		generation:    pn.generation,
 	}
@@ -127,6 +133,16 @@ func (pn *PotentialNode) Clone() *PotentialNode {
 
 func (pn *PotentialNode) AddPodInfo(podInfo fwk.PodInfo) {
 	pn.pods = append(pn.pods, podInfo)
+	if pn.requested == nil {
+		pn.requested = v1.ResourceList{}
+	}
+	for _, c := range podInfo.GetPod().Spec.Containers {
+		for name, qty := range c.Resources.Requests {
+			existing := pn.requested[name]
+			existing.Add(qty)
+			pn.requested[name] = existing
+		}
+	}
 	pn.generation++
 	pn.representative = nil
 }
@@ -158,6 +174,14 @@ func (pn *PotentialNode) RemovePod(logger klog.Logger, pod *v1.Pod) error {
 	for i, p := range pn.pods {
 		if p.GetPod().UID == pod.UID {
 			pn.pods = append(pn.pods[:i], pn.pods[i+1:]...)
+			for _, c := range pod.Spec.Containers {
+				for name, qty := range c.Resources.Requests {
+					if existing, ok := pn.requested[name]; ok {
+						existing.Sub(qty)
+						pn.requested[name] = existing
+					}
+				}
+			}
 			pn.generation++
 			pn.representative = nil
 			return nil
@@ -360,17 +384,40 @@ func (pn *PotentialNode) Narrow(podReqs capacity.Requirements, podRequests v1.Re
 	return nil
 }
 
-// CumulativeRequestsWith returns sum of placed pods' requests + additional.
-func (pn *PotentialNode) CumulativeRequestsWith(additional v1.ResourceList) v1.ResourceList {
-	total := make(v1.ResourceList)
-	for _, pi := range pn.pods {
-		for _, c := range pi.GetPod().Spec.Containers {
-			for name, qty := range c.Resources.Requests {
-				existing := total[name]
-				existing.Add(qty)
-				total[name] = existing
-			}
+// CouldFit is an O(types) capacity-only pre-check: could `additional` CPU/memory
+// fit on top of what's already placed, given the claim's MOST-GENEROUS surviving
+// instance type? It is a cheap necessary condition (not sufficient — it ignores
+// label narrowing and other resources), used to skip the expensive allocating
+// Narrow probe for claims that obviously can't accept the pod. Returns true when
+// unsure (no CPU/mem request, or no surviving types), so it never wrongly rejects.
+func (pn *PotentialNode) CouldFit(additional v1.ResourceList) bool {
+	if len(pn.InstanceTypes) == 0 {
+		return true // let Narrow decide
+	}
+	alloc := pn.GetAllocatable()
+	if cpu, ok := additional[v1.ResourceCPU]; ok {
+		used := pn.requested.Cpu().MilliValue()
+		if used+cpu.MilliValue() > alloc.GetMilliCPU() {
+			return false
 		}
+	}
+	if mem, ok := additional[v1.ResourceMemory]; ok {
+		used := pn.requested.Memory().Value()
+		if used+mem.Value() > alloc.GetMemory() {
+			return false
+		}
+	}
+	return true
+}
+
+// CumulativeRequestsWith returns sum of placed pods' requests + additional. The
+// placed-pods sum is maintained incrementally in AddPodInfo (pn.requested), so this
+// is O(resources), not O(pods) — a per-probe rescan of every placed pod is what
+// made greedy packing superlinear in batch size.
+func (pn *PotentialNode) CumulativeRequestsWith(additional v1.ResourceList) v1.ResourceList {
+	total := make(v1.ResourceList, len(pn.requested)+len(additional))
+	for name, qty := range pn.requested {
+		total[name] = qty.DeepCopy()
 	}
 	for name, qty := range additional {
 		existing := total[name]

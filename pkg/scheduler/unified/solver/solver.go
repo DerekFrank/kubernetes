@@ -167,7 +167,16 @@ func NewNodeClaim(pod *v1.Pod, offerings []*capacity.InstanceType) *virtualnode.
 // tryAdd attempts to place pod on claim by applying the hard Narrowers, rolling
 // back on failure so a rejected probe doesn't mutate the claim. Returns true if the
 // pod was placed (claim narrowed + pod recorded).
+//
+// A cheap O(1) capacity gate runs first: if the pod's CPU/memory can't fit even the
+// claim's most-generous surviving instance type given what's already placed, skip
+// the allocating Narrow probe entirely. In dense packing most open claims are full,
+// so this turns the common "re-probe a full claim" case from an allocating narrow
+// into arithmetic — the fix for greedy's superlinear allocation.
 func tryAdd(claim *virtualnode.PotentialNode, pod *v1.Pod, narrowers []virtualnode.Narrower) bool {
+	if !claim.CouldFit(podRequests(pod)) {
+		return false
+	}
 	savedTypes := claim.InstanceTypes
 	savedReqs := claim.Requirements
 	if status := claim.NarrowForPod(pod, narrowers...); !status.IsSuccess() {

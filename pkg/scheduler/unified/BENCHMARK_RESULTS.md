@@ -25,26 +25,38 @@ benchmarked yet, that is stated rather than faked.
 "few large nodes, not many small ones" property that makes batch provisioning worth
 doing, reproduced on the new solver.
 
-### Greedy latency — a real, measured problem
+### Greedy latency — was superlinear (implementation bug), now near-linear after fix
 
-| pods | greedy ns/op | naive ns/op | greedy allocs/op |
-|---|---|---|---|
-| 100 | 8.2ms | 13.0ms | 51k |
-| 500 | 143ms | 62ms | 881k |
-| 1000 | **556ms** | 119ms | **3.3M** |
+The first cut was superlinear (556ms at 1000 pods, slower than naive) — **not
+inherent to greedy, an implementation regression.** Two causes, both fixed:
 
-**Greedy is superlinear and, past ~500 pods, slower than naive.** Naive is ~linear
-(it never re-probes existing claims); greedy pays O(pods × open-claims) probes, and
-each probe clones + narrows the claim's requirement set and instance-type slice —
-3.3M allocations at 1000 pods. This is the honest cost of first-fit-onto-every-open-
-claim with immutable-probe semantics.
+1. **O(k)-per-probe rescan:** `CumulativeRequestsWith` re-summed every pod already on
+   a claim on every probe — the exact O(pods²) bug the inline `schedule.solve()` path
+   already fixed once (maintain a running requested-total → O(1)). `solver.Greedy`
+   reintroduced it; now fixed with an incremental `PotentialNode.requested` total.
+2. **Allocating probe against every open claim:** each pod probed *every* open claim,
+   and each probe called `Narrow` (rebuild requirement map + re-filter instance-type
+   slice), rolled back on failure. In dense packing most open claims are full, so this
+   re-confirmed "full" with an allocation over and over. Fixed with `CouldFit` — an
+   O(1) CPU/memory capacity gate that skips the allocating probe for claims that
+   obviously can't fit.
 
-This does **not** refute the design — it localizes the cost to the greedy solver's
-probe/rollback implementation, which is optimizable (candidate reuse instead of
-clone-per-probe; indexing open claims by compatibility instead of scanning all).
-But as written today, greedy's packing win comes at a latency cost that grows with
-batch size, and that is the first thing to fix before any "faster" claim against a
-production system is credible.
+| pods | greedy BEFORE | greedy AFTER | naive | allocs before → after |
+|---|---|---|---|---|
+| 100 | 8.2ms | **4.6ms** | 13ms | 51k → 32k |
+| 500 | 143ms | **30ms** | 62ms | 881k → 199k |
+| 1000 | 556ms | **76ms** | 119ms | 3.3M → 515k |
+
+**After the fix greedy is faster than naive at every size** and scales ~pods^1.2
+(10× pods → 16.5× time, down from 68×). Node counts are unchanged (4/19/37) — the
+fix is pure latency, no packing-quality cost. The residual mild super-linearity is
+the O(pods × open-claims) probe scan itself; bounding the probe frontier
+(first-fit-decreasing over a capacity-indexed subset) would take it to ~linear, and
+is the remaining optimization.
+
+Note: `solver.Greedy` is a straightforward first-fit, **not** a port of Karpenter's
+scheduler — the earlier "what Karpenter does in spirit" comment was overstated and
+has been corrected in the code.
 
 ### Catalog-width scaling — linear in distinct offering shapes
 
@@ -104,7 +116,7 @@ small hard splits) is the optimization the numbers argue for.
 ## Takeaways
 
 1. **Packing works** — the core value (dense consolidation vs per-pod) is real and measured.
-2. **Greedy latency is the bug to fix** — superlinear, alloc-heavy, slower than naive past 500 pods. Clone-per-probe is the culprit; it's an implementation problem, not a design one.
+2. **Greedy latency: was an implementation bug, now fixed** — the initial superlinearity (rescan + allocating-probe-against-every-claim) was not inherent to greedy. After the running-total + `CouldFit` gate fixes it's near-linear (~pods^1.2) and faster than naive. Remaining: bound the probe frontier for true linearity.
 3. **The portfolio isn't free** — greedy is already optimal on easy batches; ILP pays off only on hard small splits, arguing for routing over fan-out-to-all.
 4. **Catalog width is linear** — wide catalogs are tractable.
 5. **The two biggest headline claims (cluster-size independence, parallelism) are structural today, not yet plotted** — honestly gated on cross-package wiring and Split, respectively.
