@@ -6,7 +6,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 // TestSchedule_MultiTypePreferencePin: several arm instance types satisfy the

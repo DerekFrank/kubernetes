@@ -13,7 +13,7 @@ import (
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 // --- Pod / offering / node builders ---

@@ -11,8 +11,8 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 func init() {

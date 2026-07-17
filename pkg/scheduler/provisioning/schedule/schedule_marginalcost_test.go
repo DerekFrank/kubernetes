@@ -14,7 +14,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 // marginalCostFramework is a minimal framework.Framework-shaped stub that runs the

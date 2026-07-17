@@ -10,7 +10,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 // This file is a *caller harness*, not part of Schedule(). It demonstrates the

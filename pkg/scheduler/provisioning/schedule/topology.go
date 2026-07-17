@@ -3,8 +3,8 @@ package schedule
 import (
 	v1 "k8s.io/api/core/v1"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 // Topology, the Karpenter way: a pod's spread constraints are turned into

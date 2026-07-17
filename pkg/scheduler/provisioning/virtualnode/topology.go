@@ -8,7 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 // Topology is the cross-pod state a topology-spread Narrower needs but a single

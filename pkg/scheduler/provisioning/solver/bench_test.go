@@ -8,8 +8,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 // Benchmarks for the provisioning pipeline. These measure the pure solver

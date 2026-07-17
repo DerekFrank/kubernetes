@@ -4,7 +4,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 // ClusterState represents the current state of the cluster for scheduling decisions.
@@ -54,7 +54,7 @@ type NodeClaimResult struct {
 	CompatibleInstanceTypes []*capacity.InstanceType
 }
 
-// Result is the output of the unified scheduling function.
+// Result is the output of the provisioning scheduling engine.
 type Result struct {
 	Bindings    []Binding
 	NodeClaims  []NodeClaimResult

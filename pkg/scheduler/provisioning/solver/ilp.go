@@ -5,7 +5,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 // ILP is a branch-and-bound solver that searches for the minimum-node-count

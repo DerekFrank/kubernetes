@@ -9,8 +9,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 const zoneKey = "topology.kubernetes.io/zone"

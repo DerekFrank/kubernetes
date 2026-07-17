@@ -3,8 +3,8 @@ package solver
 import (
 	v1 "k8s.io/api/core/v1"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 // Pipeline is the provisioning orchestrator: Batch → Split → Solve (fan-out) →
@@ -13,7 +13,7 @@ import (
 // (identity), so the live shape is: one split, fan out to all Solvers, Select the
 // cheapest. Registering a second Solver turns on the portfolio with no API change.
 type Pipeline struct {
-	Solvers   []Solver              // fan-out set; one = singleton, Select is identity
+	Solvers   []Solver               // fan-out set; one = singleton, Select is identity
 	Narrowers []virtualnode.Narrower // constraint plugins every solver consults
 }
 

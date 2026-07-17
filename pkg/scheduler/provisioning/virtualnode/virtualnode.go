@@ -1,10 +1,14 @@
 // Package virtualnode implements PotentialNode — a NodeInfo variant that represents
 // potential capacity as a superposition of compatible instance types.
 //
-// PotentialNode flows through the same Filter/Score pipeline as concrete nodes.
-// Plugins are modified to detect it via the IsPotentialNode interface and operate
-// on the superposition (narrowing compatible instance types) rather than checking
-// fixed resources/labels.
+// PotentialNode does NOT flow through the concrete Filter/Score plugin pipeline. The
+// bind path filters concrete nodes with stock, unmodified kube-scheduler plugins; the
+// provisioning path narrows this superposition directly via NarrowForPod, off the
+// framework entirely (a PotentialNode is not a concrete NodeInfo, and the narrowing
+// that matters — constraint intersection over the instance-type catalog — was never
+// kube-scheduler plugin logic). This is the D19 split: no plugin fork, no
+// divergence-from-upstream debt. A PotentialNode is a mutable superposition until it
+// fires and an immutable commitment after (see fire.go).
 package virtualnode
 
 import (
@@ -16,15 +20,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
-	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
 )
 
 var nodeCounter int64
 
-// IsPotentialNode is the interface that NodeClaim-aware plugins use to detect
-// whether a NodeInfo represents potential (not-yet-provisioned) capacity.
+// IsPotentialNode lets code holding a fwk.NodeInfo recover the underlying
+// PotentialNode (potential, not-yet-provisioned capacity) via a type assertion.
+// Under the D19 split the concrete Filter/Score plugins never see a PotentialNode —
+// they only ever run against real nodes — so this is used by the provisioning path
+// and callers inspecting a mixed node set, NOT by "NodeClaim-aware" forked plugins
+// (there are none).
 type IsPotentialNode interface {
 	GetPotentialNode() *PotentialNode
 }
@@ -46,6 +54,18 @@ type PotentialNode struct {
 	hostname       string
 	generation     int64
 	representative *v1.Node // lazily computed
+
+	// fired records whether this claim has crossed the fire boundary (handed to the
+	// cloud provider). Pre-fire the claim is a mutable superposition; post-fire it is
+	// an immutable commitment — Narrow/UnNarrow are rejected. See fire.go.
+	fired bool
+	// birthReqs / birthTypes are the widest (⊤) requirement set and instance-type
+	// catalog the claim was constructed from, captured at New(). UnNarrow recomputes
+	// the claim from its surviving members by rebuilding from this birth ⊤ and
+	// re-narrowing each remaining member — narrowing is lossy (monotone intersection),
+	// so the only correct un-narrow is recompute-from-members, not per-pod subtraction.
+	birthReqs  capacity.Requirements
+	birthTypes []*capacity.InstanceType
 }
 
 // New creates a PotentialNode from base requirements and compatible instance types.
@@ -57,11 +77,20 @@ func New(baseReqs capacity.Requirements, instanceTypes []*capacity.InstanceType,
 	reqs.Add(baseReqs)
 	reqs[v1.LabelHostname] = capacity.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, hostname)
 
+	// Capture the birth ⊤ (widest requirements + full catalog) so UnNarrow can
+	// recompute the claim from its surviving members. birthReqs is a deep copy so
+	// later narrowing of pn.Requirements can't mutate it; birthTypes shares the
+	// (immutable) instance-type pointers.
+	birthReqs := capacity.NewRequirements()
+	birthReqs.Add(reqs)
+
 	return &PotentialNode{
 		Requirements:  reqs,
 		InstanceTypes: instanceTypes,
 		Taints:        taints,
 		hostname:      hostname,
+		birthReqs:     birthReqs,
+		birthTypes:    append([]*capacity.InstanceType(nil), instanceTypes...),
 	}
 }
 
@@ -78,21 +107,21 @@ func (pn *PotentialNode) Node() *v1.Node {
 	return pn.representative
 }
 
-func (pn *PotentialNode) GetPods() []fwk.PodInfo                    { return pn.pods }
-func (pn *PotentialNode) GetPodsWithAffinity() []fwk.PodInfo        { return nil }
-func (pn *PotentialNode) GetPodsWithRequiredAntiAffinity() []fwk.PodInfo { return nil }
-func (pn *PotentialNode) GetUsedPorts() fwk.HostPortInfo            { return make(fwk.HostPortInfo) }
+func (pn *PotentialNode) GetPods() []fwk.PodInfo                            { return pn.pods }
+func (pn *PotentialNode) GetPodsWithAffinity() []fwk.PodInfo                { return nil }
+func (pn *PotentialNode) GetPodsWithRequiredAntiAffinity() []fwk.PodInfo    { return nil }
+func (pn *PotentialNode) GetUsedPorts() fwk.HostPortInfo                    { return make(fwk.HostPortInfo) }
 func (pn *PotentialNode) GetImageStates() map[string]*fwk.ImageStateSummary { return nil }
-func (pn *PotentialNode) GetPVCRefCounts() map[string]int           { return nil }
-func (pn *PotentialNode) GetGeneration() int64                      { return pn.generation }
-func (pn *PotentialNode) GetNodeDeclaredFeatures() ndf.FeatureSet   { return ndf.FeatureSet{} }
-func (pn *PotentialNode) String() string                            { return fmt.Sprintf("PotentialNode(%s)", pn.hostname) }
+func (pn *PotentialNode) GetPVCRefCounts() map[string]int                   { return nil }
+func (pn *PotentialNode) GetGeneration() int64                              { return pn.generation }
+func (pn *PotentialNode) GetNodeDeclaredFeatures() ndf.FeatureSet           { return ndf.FeatureSet{} }
+func (pn *PotentialNode) String() string                                    { return fmt.Sprintf("PotentialNode(%s)", pn.hostname) }
 
 func (pn *PotentialNode) GetNodeAllocatableDRAClaimState() map[types.NamespacedName]*fwk.NodeAllocatableDRAClaimState {
 	return nil
 }
 
-func (pn *PotentialNode) GetRequested() fwk.Resource    { return &zeroResource{} }
+func (pn *PotentialNode) GetRequested() fwk.Resource        { return &zeroResource{} }
 func (pn *PotentialNode) GetNonZeroRequested() fwk.Resource { return &zeroResource{} }
 
 // GetAllocatable returns the MAXIMUM allocatable across compatible types.
@@ -128,6 +157,9 @@ func (pn *PotentialNode) Clone() *PotentialNode {
 		requested:     requested,
 		hostname:      pn.hostname,
 		generation:    pn.generation,
+		fired:         pn.fired,
+		birthReqs:     pn.birthReqs,
+		birthTypes:    pn.birthTypes,
 	}
 }
 
@@ -385,8 +417,14 @@ func podResourceRequests(pod *v1.Pod) v1.ResourceList {
 	return total
 }
 
-// Narrow intersects requirements and filters instance types.
+// Narrow intersects requirements and filters instance types. It is rejected after
+// the claim has fired: a fired claim is an immutable commitment (its size/domain is
+// purchased and cannot be un-said), so narrowing it is a programming error, not a
+// no-op. See fire.go for the fire boundary.
 func (pn *PotentialNode) Narrow(podReqs capacity.Requirements, podRequests v1.ResourceList) error {
+	if pn.fired {
+		return fmt.Errorf("cannot narrow %s: claim has fired (immutable post-fire)", pn.hostname)
+	}
 	narrowed := capacity.NewRequirements()
 	narrowed.Add(pn.Requirements)
 	narrowed.Add(podReqs)

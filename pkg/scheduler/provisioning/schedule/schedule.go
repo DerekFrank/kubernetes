@@ -1,9 +1,16 @@
-// Package schedule implements the unified scheduling function that evaluates
-// binding, provisioning, and preemption as alternatives in one pass.
+// Package schedule implements the provisioning scheduling engine: a pure function
+// that evaluates binding, provisioning, and preemption for a batch of pods and
+// returns a plan (the caller executes it).
 //
-// PotentialNodes flow through the SAME Filter/Score pipeline as concrete nodes.
-// Modified plugins detect PotentialNodes and narrow the superposition as a side
-// effect of Filter, making "potential new node" a first-class scheduling concept.
+// The engine is bind-first (preferred-architecture.md, D17): a pod with a feasible
+// bind to retained capacity binds immediately via the stock, unmodified
+// kube-scheduler Filter plugins — PotentialNodes never reach the framework. Only the
+// unschedulable remainder enters the provisioning follow-up, where in-flight
+// NodeClaims are first-class cycle candidates (Filtered/scored/packed onto like real
+// nodes) and the speculative "open a brand-new node?" dummy is minted only when no
+// existing node and no in-flight claim can host the pod — which is exactly
+// PostFilter's native trigger (see mintDummy). The dummy is the one thing that lives
+// outside the cycle; everything else about provisioning is a native cycle capability.
 package schedule
 
 import (
@@ -15,8 +22,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 // Schedule evaluates a batch of pods against existing nodes and potential capacity,
@@ -216,10 +223,17 @@ func solve(
 		}
 
 		// --- Tier 2: the unconstrained dummy (effective = a whole new node) ---
-		// We always offer the option of launching a brand-new node. The dummy is
+		// The dummy is the speculative "should we open a brand-new node at all?"
+		// question. Per the preferred architecture it is the ONE thing that lives
+		// outside the cycle: it is minted here only because we have reached the
+		// unschedulable remainder (no existing node and — after tier 1 above — no
+		// in-flight claim can host the pod), which is exactly kube-scheduler's
+		// PostFilter trigger (Filter failed everywhere). In the production shape,
+		// mintDummy + the scorers below become the body of a tiny PostFilter plugin;
+		// in-flight claims (tier 1) stay cycle-native and never pay this. The dummy is
 		// built fresh per pod from the full offering set, then narrowed by the pod's
 		// hard constraints; its baseline is 0 because it is not yet part of the plan.
-		dummy := createPotentialNode(pod, offerings)
+		dummy := mintDummy(pod, offerings)
 		if dummy != nil {
 			status := dummy.NarrowForPod(pod)
 			if status.IsSuccess() {
@@ -574,8 +588,13 @@ func betterCandidate(m1 float64, t1 int, m0 float64, t0 int) bool {
 	return t1 < t0
 }
 
-// createPotentialNode builds a PotentialNode from offerings compatible with a pod.
-func createPotentialNode(pod *v1.Pod, offerings []*capacity.InstanceType) *virtualnode.PotentialNode {
+// mintDummy builds a fresh dummy PotentialNode from the offerings compatible with a
+// pod — the speculative "open a brand-new node?" superposition. It is the seam the
+// preferred architecture quarantines in a PostFilter plugin: it is called only for
+// the unschedulable remainder (bind failed everywhere and no in-flight claim fits),
+// which is PostFilter's native trigger, and it is the only thing that lives outside
+// the cycle. Returns nil if no offering can host the pod at all.
+func mintDummy(pod *v1.Pod, offerings []*capacity.InstanceType) *virtualnode.PotentialNode {
 	podReqs := podSchedulingRequirements(pod)
 	podRequests := podTotalRequests(pod)
 

@@ -17,8 +17,8 @@ package solver
 import (
 	v1 "k8s.io/api/core/v1"
 
-	"k8s.io/kubernetes/pkg/scheduler/unified/capacity"
-	"k8s.io/kubernetes/pkg/scheduler/unified/virtualnode"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
 )
 
 // Problem is the solver-neutral description of a provisioning sub-problem (one

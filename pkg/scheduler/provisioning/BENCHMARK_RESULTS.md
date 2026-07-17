@@ -1,10 +1,10 @@
 # Provisioning Solver — Benchmark Results
 
-Measured on the `solver` package (`pkg/scheduler/unified/solver`), the pure
+Measured on the `solver` package (`pkg/scheduler/provisioning/solver`), the pure
 provisioning core (`Problem → []Solution`). 48-core machine. Run with:
 
 ```
-go test ./pkg/scheduler/unified/solver/ -bench . -benchmem -run '^$'
+go test ./pkg/scheduler/provisioning/solver/ -bench . -benchmem -run '^$'
 ```
 
 These test the design's headline claims. Where a claim **can't** be honestly
