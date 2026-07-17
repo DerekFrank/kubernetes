@@ -111,6 +111,52 @@ func TestFire_OneWayGate(t *testing.T) {
 	}
 }
 
+// TestFire_PostFirePodLeaveIsFrozen: the post-fire side of the gate. Once a claim
+// has fired, a departing pod leaves SLACK on an oversized node — the scheduler does
+// not re-solve, shrink, or cancel. So RemovePod still updates occupancy, but the
+// committed instance-type set is frozen (no re-narrow) and UnNarrow is refused. This
+// is what makes the post-commitment side trivial: the "re-narrow strands a staying
+// pod" case is structurally impossible once fired, because no re-solve happens.
+func TestFire_PostFirePodLeaveIsFrozen(t *testing.T) {
+	amd := fireTestType("m5.large", "amd64", 8, 16, "z1", "z2")
+	arm := fireTestType("m6g.large", "arm64", 8, 16, "z1", "z2")
+	claim := newTestClaim(amd, arm)
+
+	p1 := firePod("p1", "arm64", 2) // pins arch→arm64 → collapses to m6g.large
+	p2 := firePod("p2", "", 2)
+	for _, p := range []*v1.Pod{p1, p2} {
+		if status := claim.NarrowForPod(p); !status.IsSuccess() {
+			t.Fatalf("narrow %s failed: %v", p.Name, status.Message())
+		}
+		claim.AddPod(p)
+	}
+	frozenTypes := typeNames(claim.InstanceTypes) // [m6g.large] — the purchased size
+
+	// Fire: the claim is now an immutable commitment (a real node that hasn't
+	// registered yet).
+	claim.Fire()
+
+	// A pod leaves post-fire. Occupancy drops, but nothing re-solves.
+	if err := claim.RemovePod(klog.TODO(), p1); err != nil {
+		t.Fatalf("remove p1 post-fire: %v", err)
+	}
+	if len(claim.GetPods()) != 1 {
+		t.Fatalf("occupancy should drop to 1 member, got %d", len(claim.GetPods()))
+	}
+	// The instance-type set is frozen — the arm64 pin does NOT re-widen even though
+	// its only pinner left. The purchase stands.
+	if got := typeNames(claim.InstanceTypes); len(got) != 1 || got[0] != frozenTypes[0] {
+		t.Fatalf("post-fire type set must stay frozen at %v, got %v", frozenTypes, got)
+	}
+	// And UnNarrow is refused — the scheduler must not try to recompute a fired claim.
+	if err := claim.UnNarrow(); err == nil {
+		t.Fatal("UnNarrow must be refused post-fire (the purchase is committed)")
+	}
+	if got := typeNames(claim.InstanceTypes); len(got) != 1 {
+		t.Fatalf("refused UnNarrow must not mutate the claim, got %v", got)
+	}
+}
+
 // TestUnNarrow_RecomputesFromMembers: a pod that pinned an axis leaves; UnNarrow
 // rebuilds the claim from surviving members, re-widening the freed axis but keeping
 // axes a staying member still pins. Recompute-from-members, not per-pod subtraction.
@@ -216,7 +262,10 @@ func TestFireTimer_QuietWindow(t *testing.T) {
 	}
 }
 
-// TestFireTimer_MaxCeiling: a claim that keeps accreting pods still fires at T-max.
+// TestFireTimer_MaxCeiling: the max-batch time. A claim that keeps accreting pods
+// (never idle for T-quiet) must still fire at the T-max ceiling, so a claim that
+// keeps drawing members can't starve launch indefinitely. This is the second,
+// distinct bound alongside the idle (T-quiet) window.
 func TestFireTimer_MaxCeiling(t *testing.T) {
 	var ft FireTimer
 	base := time.Unix(2000, 0)
@@ -234,5 +283,97 @@ func TestFireTimer_MaxCeiling(t *testing.T) {
 	// At t=60s the T-max ceiling forces a fire even though it never went quiet.
 	if !ft.ShouldFire(base.Add(60*time.Second), quiet, max) {
 		t.Fatal("must fire at T-max ceiling even while still accreting")
+	}
+}
+
+// TestFireTimer_LeaveResetsQuietWindow: the doc says the T-quiet timer resets on any
+// membership CHANGE — add OR leave. A pod leaving must reset the idle window just as
+// an add does, so a claim that is still churning (losing members) doesn't fire
+// prematurely mid-change.
+func TestFireTimer_LeaveResetsQuietWindow(t *testing.T) {
+	var ft FireTimer
+	base := time.Unix(3000, 0)
+	quiet := 10 * time.Second
+	max := 5 * time.Minute
+
+	ft.Touch(base) // a pod joins at t=0
+	// t=8s: a pod LEAVES (opportunistic rebind / UnNarrow). This is a membership
+	// change and must reset the quiet window, exactly like an add.
+	ft.Touch(base.Add(8 * time.Second))
+	if ft.ShouldFire(base.Add(15*time.Second), quiet, max) {
+		t.Fatal("a pod leaving must reset the quiet window (only 7s since the leave)")
+	}
+	// 10s of quiet after the leave (t=8s) → fire at t=18s.
+	if !ft.ShouldFire(base.Add(18*time.Second), quiet, max) {
+		t.Fatal("must fire once quiet window elapses since the last change (the leave)")
+	}
+}
+
+// TestUnNarrow_DissolvesEmptyClaim: pre-fire, when the last member leaves, UnNarrow
+// resets the claim to its birth ⊤ with no members — the "if members → ∅, the claim
+// dissolves" case (the caller drops a member-less claim).
+func TestUnNarrow_DissolvesEmptyClaim(t *testing.T) {
+	amd := fireTestType("m5.large", "amd64", 8, 16, "z1", "z2")
+	arm := fireTestType("m6g.large", "arm64", 8, 16, "z1", "z2")
+	claim := newTestClaim(amd, arm)
+
+	p1 := firePod("p1", "arm64", 2) // pins arch→arm64
+	if status := claim.NarrowForPod(p1); !status.IsSuccess() {
+		t.Fatalf("narrow p1 failed: %v", status.Message())
+	}
+	claim.AddPod(p1)
+	if len(claim.InstanceTypes) != 1 {
+		t.Fatalf("expected claim pinned to 1 type, got %v", typeNames(claim.InstanceTypes))
+	}
+
+	// The last member leaves.
+	if err := claim.RemovePod(klog.TODO(), p1); err != nil {
+		t.Fatalf("remove p1: %v", err)
+	}
+	if err := claim.UnNarrow(); err != nil {
+		t.Fatalf("unnarrow: %v", err)
+	}
+	if len(claim.GetPods()) != 0 {
+		t.Fatalf("dissolved claim must have no members, got %d", len(claim.GetPods()))
+	}
+	// Requirements/types are back at birth ⊤ (both instance types), so the caller
+	// sees a claim that would provision nothing — it drops it.
+	if len(claim.InstanceTypes) != 2 {
+		t.Fatalf("dissolved claim must reset to birth ⊤ (both types), got %v", typeNames(claim.InstanceTypes))
+	}
+}
+
+// TestUnNarrow_ReWidensInstanceTypeSet: the departing pod pinned the RESOURCE axis
+// (it forced a bigger instance type), not a label. UnNarrow must re-widen the
+// instance-type set too — recompute-from-members works on every narrowing dimension,
+// not just labels.
+func TestUnNarrow_ReWidensInstanceTypeSet(t *testing.T) {
+	small := fireTestType("m5.large", "amd64", 4, 16, "z1")   // 4 CPU
+	large := fireTestType("m5.xlarge", "amd64", 16, 64, "z1") // 16 CPU
+	claim := newTestClaim(small, large)
+
+	// big needs 6 CPU → only m5.xlarge (16) fits; small needs 2 CPU → either fits.
+	big := firePod("big", "", 6)
+	small2 := firePod("small", "", 2)
+	for _, p := range []*v1.Pod{big, small2} {
+		if status := claim.NarrowForPod(p); !status.IsSuccess() {
+			t.Fatalf("narrow %s failed: %v", p.Name, status.Message())
+		}
+		claim.AddPod(p)
+	}
+	if len(claim.InstanceTypes) != 1 || claim.InstanceTypes[0].Name != "m5.xlarge" {
+		t.Fatalf("expected claim forced to m5.xlarge by the 6-CPU pod, got %v", typeNames(claim.InstanceTypes))
+	}
+
+	// The big (resource-pinning) pod leaves; only the 2-CPU pod remains.
+	if err := claim.RemovePod(klog.TODO(), big); err != nil {
+		t.Fatalf("remove big: %v", err)
+	}
+	if err := claim.UnNarrow(); err != nil {
+		t.Fatalf("unnarrow: %v", err)
+	}
+	// The 2-CPU survivor fits both types, so the small type returns to the set.
+	if len(claim.InstanceTypes) != 2 {
+		t.Fatalf("resource axis must re-widen: expected both types back, got %v", typeNames(claim.InstanceTypes))
 	}
 }
