@@ -1,0 +1,252 @@
+// Package solver is the pure provisioning core described in
+// provisioning-pipeline-scratch.md: given the pods that could not bind and a set
+// of offerings, decide what new capacity to create. It has NO cluster state, NO
+// snapshot, NO framework handle — a Solver is a pure function Problem → []Solution,
+// which is what makes the fan-out portfolio raceless and parallelizable.
+//
+// There are two plugin surfaces here:
+//   - Narrower (from the virtualnode package): the conjunctive constraint surface
+//     (taints, requirements, ... ) — solvers CONSULT it, they do not contain it.
+//   - Solver: the competitive packing-strategy surface (greedy, ILP) — the framework
+//     fans out to all registered solvers and Select picks the best.
+//
+// Cost is not a plugin: price (incl. performance-value) is offering data, read off
+// the offering via EffectivePrice. Select compares Solutions on derived cost.
+package solver
+
+import (
+	v1 "k8s.io/api/core/v1"
+
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/capacity"
+	"k8s.io/kubernetes/pkg/scheduler/provisioning/virtualnode"
+)
+
+// Problem is the solver-neutral description of a provisioning sub-problem (one
+// Split). It is immutable — every solver reads the same Problem concurrently.
+type Problem struct {
+	// Pods is the set to provision capacity for (the unschedulable remainder).
+	Pods []*v1.Pod
+	// Offerings is the catalog new capacity can be built from.
+	Offerings []*capacity.InstanceType
+	// Narrowers are the constraint plugins every solver consults. Empty means the
+	// built-in node-local defaults (taints + affinity + resources) via
+	// virtualnode.DefaultNarrowers.
+	Narrowers []virtualnode.Narrower
+	// Topology, if set, carries the cross-pod spread state (per-key domain counts +
+	// universe). It is the PreFilter-analog state a topology-spread Narrower needs
+	// and a single (pod, claim) pair cannot hold. When set, a TopologySpreadNarrower
+	// reading/updating it is appended to the narrower chain.
+	Topology *virtualnode.Topology
+}
+
+func (p Problem) narrowers() []virtualnode.Narrower {
+	ns := p.Narrowers
+	if len(ns) == 0 {
+		ns = virtualnode.DefaultNarrowers()
+	}
+	if p.Topology != nil {
+		ns = append(append([]virtualnode.Narrower(nil), ns...), virtualnode.NewTopologySpreadNarrower(p.Topology))
+	}
+	return ns
+}
+
+// NodeClaim is the Kubernetes-shaped output for one piece of new capacity: the
+// accumulated requirements + the still-compatible instance types ("any of these
+// will do" — the offering axis is emitted as a set, not collapsed), for the cloud
+// provider to fulfill. Mirrors Karpenter's v1.NodeClaim; a production version emits
+// the real CRD.
+type NodeClaim struct {
+	Name          string
+	Requirements  capacity.Requirements
+	InstanceTypes []*capacity.InstanceType
+	Requests      v1.ResourceList
+	CheapestPrice float64
+}
+
+// PodBinding is the Kubernetes-shaped assignment of a pod to the capacity that will
+// host it — here, the NodeClaim it will land on once provisioned (bound for real by
+// the caller after the node registers, per the nominate-to-NodeClaim model, D18).
+type PodBinding struct {
+	Pod           *v1.Pod
+	NodeClaimName string
+}
+
+// Solution is one candidate answer for a Problem, in Kubernetes terms: the
+// NodeClaims to create, the PodBindings mapping each placed pod to its claim, and
+// the pods that could not be placed. Cost is derived (sum of each claim's cheapest
+// effective price), not supplied by the solver, so Select compares candidates on
+// one ruler no solver can game.
+type Solution struct {
+	NodeClaims []NodeClaim
+	Bindings   []PodBinding
+	Unplaced   []*v1.Pod
+}
+
+// Cost is the derived comparison metric: total cheapest-effective-price across the
+// NodeClaims. Lower is better. Unplaced pods are penalized heavily so a solution
+// that strands pods never beats one that places them.
+func (s Solution) Cost() float64 {
+	var total float64
+	for _, c := range s.NodeClaims {
+		total += c.CheapestPrice
+	}
+	total += float64(len(s.Unplaced)) * unplacedPenalty
+	return total
+}
+
+// NodeCount is the price-free comparison metric (for non-priced fleets / O2): fewer
+// nodes is better, ties broken by fewer unplaced.
+func (s Solution) NodeCount() int { return len(s.NodeClaims) + len(s.Unplaced)*1000 }
+
+const unplacedPenalty = 1e9
+
+// finalize converts internal working claims (PotentialNode superpositions with
+// their assigned pods) into the Kubernetes-shaped Solution. This is where the
+// working representation becomes NodeClaims[] + PodBindings[].
+func finalize(claims []*virtualnode.PotentialNode, unplaced []*v1.Pod) Solution {
+	sol := Solution{Unplaced: unplaced}
+	for _, c := range claims {
+		pods := c.GetPods()
+		if len(pods) == 0 {
+			continue
+		}
+		requests := make(v1.ResourceList)
+		for _, pi := range pods {
+			pod := pi.GetPod()
+			sol.Bindings = append(sol.Bindings, PodBinding{Pod: pod, NodeClaimName: c.Hostname()})
+			for _, ctr := range pod.Spec.Containers {
+				for name, qty := range ctr.Resources.Requests {
+					existing := requests[name]
+					existing.Add(qty)
+					requests[name] = existing
+				}
+			}
+		}
+		reqs := capacity.NewRequirements()
+		for key, req := range c.Requirements {
+			if key == v1.LabelHostname {
+				continue
+			}
+			reqs[key] = req.Copy()
+		}
+		sol.NodeClaims = append(sol.NodeClaims, NodeClaim{
+			Name:          c.Hostname(),
+			Requirements:  reqs,
+			InstanceTypes: c.InstanceTypes,
+			Requests:      requests,
+			CheapestPrice: c.CheapestPrice(),
+		})
+	}
+	return sol
+}
+
+// Solver is the competitive packing-strategy plugin surface. Solve is pure: it
+// reads only the Problem and returns candidate Solutions (usually one; an
+// anytime/frontier solver may return several). Every solver consults the Problem's
+// Narrowers and builds claims via NewNodeClaim.
+type Solver interface {
+	Name() string
+	Solve(Problem) []Solution
+}
+
+// NewNodeClaim constructs the widest valid claim (⊤) over the offerings compatible
+// with pod: all such instance types, overhead-correct allocatable (owned by
+// capacity.InstanceType.Allocatable). This is the shared constructor every solver
+// uses; it does NOT seed the pod (open-claim and add-pod are separate ops).
+// Returns nil if no offering can host the pod at all.
+func NewNodeClaim(pod *v1.Pod, offerings []*capacity.InstanceType) *virtualnode.PotentialNode {
+	reqs := podRequirements(pod)
+	requests := podRequests(pod)
+
+	var compatible []*capacity.InstanceType
+	for _, it := range offerings {
+		if !reqs.Compatible(it.Requirements) {
+			continue
+		}
+		if !virtualnode.ResourcesFit(it.Allocatable(), requests) {
+			continue
+		}
+		compatible = append(compatible, it)
+	}
+	if len(compatible) == 0 {
+		return nil
+	}
+	return virtualnode.New(unionRequirements(compatible), compatible, nil)
+}
+
+// tryAdd attempts to place pod on claim by applying the hard Narrowers, rolling
+// back on failure so a rejected probe doesn't mutate the claim. Returns true if the
+// pod was placed (claim narrowed + pod recorded).
+//
+// A cheap O(1) capacity gate runs first: if the pod's CPU/memory can't fit even the
+// claim's most-generous surviving instance type given what's already placed, skip
+// the allocating Narrow probe entirely. In dense packing most open claims are full,
+// so this turns the common "re-probe a full claim" case from an allocating narrow
+// into arithmetic — the fix for greedy's superlinear allocation.
+func tryAdd(claim *virtualnode.PotentialNode, pod *v1.Pod, narrowers []virtualnode.Narrower) bool {
+	if !claim.CouldFit(podRequests(pod)) {
+		return false
+	}
+	savedTypes := claim.InstanceTypes
+	savedReqs := claim.Requirements
+	if status := claim.NarrowForPod(pod, narrowers...); !status.IsSuccess() {
+		claim.InstanceTypes = savedTypes
+		claim.Requirements = savedReqs
+		return false
+	}
+	claim.AddPod(pod)
+	// Fire commit hooks for Narrowers that maintain cross-pod state (topology): the
+	// placement is now kept, so their shared state must reflect it for the next pod.
+	// Only reached on a successful, non-rolled-back placement.
+	for _, n := range narrowers {
+		if c, ok := n.(virtualnode.Committer); ok {
+			c.OnCommit(pod, claim)
+		}
+	}
+	return true
+}
+
+// --- pod helpers ---
+
+// podRequirements extracts a pod's hard label constraints. Delegates to
+// virtualnode.PodHardRequirements so there is a single extraction implementation
+// (honors all operators via the ported capacity.Requirement).
+func podRequirements(pod *v1.Pod) capacity.Requirements {
+	return virtualnode.PodHardRequirements(pod)
+}
+
+func podRequests(pod *v1.Pod) v1.ResourceList {
+	total := make(v1.ResourceList)
+	for _, c := range pod.Spec.Containers {
+		for name, qty := range c.Resources.Requests {
+			existing := total[name]
+			existing.Add(qty)
+			total[name] = existing
+		}
+	}
+	return total
+}
+
+func podCPUMillis(pod *v1.Pod) int64 {
+	var m int64
+	for _, c := range pod.Spec.Containers {
+		if cpu, ok := c.Resources.Requests[v1.ResourceCPU]; ok {
+			m += cpu.MilliValue()
+		}
+	}
+	return m
+}
+
+func unionRequirements(types []*capacity.InstanceType) capacity.Requirements {
+	union := capacity.NewRequirements()
+	for _, it := range types {
+		for key, req := range it.Requirements {
+			if existing, ok := union[key]; ok {
+				union[key] = existing.Union(req)
+			} else {
+				union[key] = req.Copy()
+			}
+		}
+	}
+	return union
+}
